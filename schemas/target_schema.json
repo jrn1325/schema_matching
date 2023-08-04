@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TargetSchema",
+  "type": "object",
+  "properties": {
+    "name": {
+      "firstname": {
+        "type": "string"
+      },
+      "lastname": {
+        "type": "string"
+      }
+    },
+    "t_sex": {
+      "type": "string"
+    },
+    "t_age": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "name",
+    "t_sex",
+    "t_age"
+  ]
+}

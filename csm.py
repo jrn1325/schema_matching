@@ -123,11 +123,27 @@ def get_key_prefix(key):
     return prefix
 
 
+def show_matches(source_vars, match_dict):
+    '''
+    Purpose: Store final matches in dictionary
+    @param: source_vars: variables of source keys, match_dict: pairs of keys that possibly match
+    @returns: dictionary of keys that definitely match
+    '''
+    final_matching = {}
+    for s_keys in match_dict.values():
+        for s_key in s_keys:
+            for (s_var, t_key) in source_vars[s_key]:
+                if bool(round(s_var.X)):
+                    final_matching[s_key] = t_key
+                    break
+    return final_matching
+
+
 def quadratic_programming(match_dict):
     """
     Purpose: Create a quadratic model to choose the best match
-    @param: match_dict: Dictionary of keys that match
-    @returns:
+    @param: match_dict: Dictionary of keys that can possibly match
+    @returns: final_match: Dictionary of keys that match
     """
     #try:
 
@@ -143,6 +159,7 @@ def quadratic_programming(match_dict):
     # Dictionary to store source variables
     source_vars = collections.defaultdict(list)
 
+    # List to store all the quadratic variables
     all_vars = []
 
     # Loop over matching target and source keys
@@ -203,7 +220,7 @@ def quadratic_programming(match_dict):
         quadratic_model.write('iis.ilp')
     quadratic_model.write('model.lp')
 
-    final_match_dict = show_matches(source_vars, match_dict)
+    return show_matches(source_vars, match_dict)
     
     #print(f"Optimal objective value: {quadratic_model.objVal}")
     # Loop over model variables and print their rounded optimum values
@@ -212,17 +229,7 @@ def quadratic_programming(match_dict):
         print(variable.varName, "=", bool(round(variable.x)))
     print()
     '''
-    return final_match_dict
 
 
 
-def show_matches(source_vars, match_dict):
-    # Create a function that takes in source and target dataframes, possible matchings and final matchings
-    final_matching = {}
-    for s_keys in match_dict.values():
-        for s_key in s_keys:
-            for (s_var, t_key) in source_vars[s_key]:
-                if bool(round(s_var.X)):
-                    final_matching[s_key] = t_key
-                    break
-    return final_matching
+

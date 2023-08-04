@@ -1,0 +1,5 @@
+{"s_name":{"firstname": "Kyla", "lastname": "Garcia"}, "firstname": "Kyla", "lastname": "Garcia", "s_sex": "female", "s_age": 10}
+{"s_name":{"firstname": "Gary", "lastname": "Holman"}, "firstname": "Gary", "lastname": "Holman", "s_sex" : "male" ,"s_age": 20}
+{"s_name":{"firstname": "Ricky", "lastname": "Villa"}, "firstname": "Ricky", "lastname": "Villa", "s_sex": "male", "s_age": 30}
+{"s_name":{"firstname": "Md", "lastname": "Dixon"}, "firstname": "Md", "lastname": "Dixon", "s_sex":"female", "s_age": 40}
+{"s_name":{"firstname": "Zac", "lastname": "Castro"}, "firstname": "Zac", "lastname": "Castro", "s_sex": "male", "s_age": 50}
