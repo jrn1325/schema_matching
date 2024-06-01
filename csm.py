@@ -2,21 +2,25 @@ import collections
 import json
 import pandas as pd
 import sys
-
 import valentine as va
 import valentine.algorithms 
 import valentine.metrics as valentine_metrics
+
 from collections import defaultdict
 from scipy.optimize import linprog
 from gurobipy import *
 
 
-def json_to_dataframe(json_file_path):
+def normalize_json(json_file_path):
+    """Normalize the JSON file by converting it into a DataFrame.
+
+    Args:
+        json_file_path (str): Path of JSON file
+
+    Returns:
+        pd.DataFrame: A DataFrame
     """
-    Purpose: Normalize the JSON file
-    @param: json_file_path: Path of JSON file
-    @returns: dataframe: Flat table 
-    """
+    
     df_list = []
     with open(json_file_path) as json_file:
         for line in json_file:
@@ -34,7 +38,7 @@ def find_valentine(df1, df2, ground_truth):
     """
     matcher = valentine.algorithms.SimilarityFlooding()
     matches = va.valentine_match(df1, df2, matcher, "target", "source")
-    metrics = valentine_metrics.all_metrics(matches, ground_truth)
+    #metrics = valentine_metrics.all_metrics(matches, ground_truth)
     match_dict = defaultdict(list)
     for match in ground_truth:
         match_dict[match[0]].append(match[1])
@@ -111,24 +115,35 @@ def linear_programming(match_dict):
 
 def get_key_prefix(key):
     """
-    Purpose: Get the prefix of a key
-    @param: key: target or source key
-    @returns: prefix
+    Get the prefix of a key.
+
+    Args:
+        key (str): Target or source key.
+
+    Returns:
+        str: The prefix of the key.
     """
+
     if '.' not in key:
-        prefix = 'ROOT_'
+        prefix = '$_'
     else:
         prefix, _ = key.rsplit('.', maxsplit = 1)
-        prefix = 'ROOT_' + prefix
+        prefix = '$_' + prefix
     return prefix
 
 
 def show_matches(source_vars, match_dict):
-    '''
-    Purpose: Store final matches in dictionary
-    @param: source_vars: variables of source keys, match_dict: pairs of keys that possibly match
-    @returns: dictionary of keys that definitely match
-    '''
+    """
+    Store final matches in a dictionary.
+
+    Args:
+        source_vars (dict): Variables of source keys.
+        match_dict (dict): Pairs of keys that possibly match.
+
+    Returns:
+        dict: Dictionary of keys that definitely match.
+    """
+
     final_matching = {}
     for s_keys in match_dict.values():
         for s_key in s_keys:
@@ -141,11 +156,18 @@ def show_matches(source_vars, match_dict):
 
 def quadratic_programming(match_dict):
     """
-    Purpose: Create a quadratic model to choose the best match
-    @param: match_dict: Dictionary of keys that can possibly match
-    @returns: final_match: Dictionary of keys that match
+    Sets up a quadratic programming model using Gurobi to find the optimal matching between 
+    target and source keys based on the provided match dictionary. It creates binary variables for potential 
+    matches and nested relationships, sets up constraints, and defines an objective function to maximize 
+    the number of matches.
+
+    Args:
+        match_dict (dict): A dictionary where keys are target keys and values are lists of source keys 
+                           that possibly match.
+
+    Returns:
+        dict: A dictionary where keys are source keys and values are target keys that definitely match.
     """
-    #try:
 
     # Initialize the quadratic model
     quadratic_model = Model("quadratic")
@@ -199,22 +221,22 @@ def quadratic_programming(match_dict):
             quadratic_model.addConstr(nested_t_var - root_var <= 0, name="Matching nested target implies matching root target.")
             quadratic_model.addConstr(nested_s_var - root_var <= 0, name="Matching nested source implies matching root source.")
     
-    # Call update if you need to examine the model because optimization
+    # Call update if you need to examine the model before optimization
     quadratic_model.update()
    
-    # Loop over the source keys
+    # Loop over the source keys to add constraints ensuring that each source key is matched to at most one target key
     for s_key in s_keys:
-        # Sum source variables constraints, It must be <= 1
         total = sum(s[0] for s in source_vars[s_key])
-        #print('TOTAL:', total)
-        # Add constraint: 
         quadratic_model.addConstr(total <= 1, name="Each source key can be matched to at most one target key.")
 
-
-    # Objective function
+    # Create an objective function
     quadratic_model.setObjective(sum(all_vars), GRB.MAXIMIZE)
     quadratic_model.setParam("OutputFlag", False)
+
+    # Optimize the objective function
     quadratic_model.optimize()
+
+    # Check if the objective function is infeasible
     if quadratic_model.getAttr(GRB.Attr.Status) == GRB.INFEASIBLE:
         quadratic_model.computeIIS()
         quadratic_model.write('iis.ilp')
@@ -222,6 +244,7 @@ def quadratic_programming(match_dict):
 
     return show_matches(source_vars, match_dict)
     
+
     #print(f"Optimal objective value: {quadratic_model.objVal}")
     # Loop over model variables and print their rounded optimum values
     ''' 
@@ -229,7 +252,3 @@ def quadratic_programming(match_dict):
         print(variable.varName, "=", bool(round(variable.x)))
     print()
     '''
-
-
-
-
