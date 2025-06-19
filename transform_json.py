@@ -13,7 +13,7 @@ import numpy as np
 import os
 import random
 import sys
-
+import time
 
 inflector = inflect.engine()
 
@@ -248,14 +248,16 @@ def nest_or_flatten(data, change_rate=1.0):
         return data
     
 
-def restructure_doc(data, model, vocab, index, vectors, change_rate):
+def restructure_doc(data, model, vocab, index, vectors, change_rate, alignment, parent_key=""):
     """
-    Apply dynamic key renaming and optional structural nesting.
+    Apply dynamic key renaming and optional structural nesting, while tracking alignments.
 
     Args:
         data: Input JSON-like object (dict or list).
-        model, vocab, index, vectors: Embedding components.
+        model, vocab, index, vectors: FastText-related objects.
         change_rate: Float [0, 1] for how aggressively to transform.
+        alignment: Dict for recording key mappings (source_path → target_path).
+        parent_key: Tracks current JSON path recursively.
 
     Returns:
         Transformed JSON object.
@@ -264,12 +266,17 @@ def restructure_doc(data, model, vocab, index, vectors, change_rate):
         renamed = {}
         for k, v in data.items():
             new_k = rename_key(k, model, vocab, index, vectors, change_rate)
-            new_v = restructure_doc(v, model, vocab, index, vectors, change_rate)
+            full_src_path = f"{parent_key}.{k}" if parent_key else k
+            full_tgt_path = f"{parent_key}.{new_k}" if parent_key else new_k
+            alignment[full_src_path] = full_tgt_path
+
+            new_v = restructure_doc(v, model, vocab, index, vectors, change_rate, alignment, full_tgt_path)
             renamed[new_k] = new_v
         return nest_or_flatten(renamed, change_rate)
 
     elif isinstance(data, list):
-        return [restructure_doc(item, model, vocab, index, vectors, change_rate) for item in data]
+        return [restructure_doc(item, model, vocab, index, vectors, change_rate, alignment, parent_key) for item in data]
+
     else:
         return data
 
@@ -291,62 +298,66 @@ def read_lines(file):
         return []
 
 
-def process_one_file(file_path, output_dir, model_path, change_rate, seed):
-    """
-    Process a single json file, transforming each line.
-    Args:
-        file_path (Path): Path to the input NDJSON file.
-        output_dir (Path): Directory to write output.
-        model_path (str): Path to FastText model file.
-        change_rate (float): [0, 1] transformation intensity.
-        seed (int): Random seed for reproducibility.
-    Returns:
-        Status message string.
-    """
-   
-
+def process_one_file(file_path, output_dir, alignment_dir, model_path, change_rate, seed):
     random.seed(seed + hash(file_path) % 10000)
 
     model = load_fasttext_model(model_path)
     vocab, vectors, index = build_vocab_index(model)
 
     output_path = output_dir / file_path.name
+    alignment_path = alignment_dir / (file_path.stem + ".alignments.json")
+
     count = 0
 
     try:
-        with open(file_path, 'r') as fin, open(output_path, 'w') as fout:
-            for i, line in enumerate(fin):
-                line = line.strip()
-                if not line:
-                    continue
+        with open(file_path, 'r') as fin:
+            lines = [line.strip() for line in fin if line.strip()]
+            if not lines:
+                return f"[Skipped] {file_path.name} — empty or invalid file"
+
+        with open(output_path, 'w') as fout, open(alignment_path, 'w') as aout:
+            for line in lines:
                 try:
                     doc = json.loads(line)
-                    transformed = restructure_doc(doc, model, vocab, index, vectors, change_rate)
+                    alignment = {}
+                    transformed = restructure_doc(doc, model, vocab, index, vectors, change_rate, alignment)
                     fout.write(json.dumps(transformed) + '\n')
+                    aout.write(json.dumps(alignment) + '\n')
                     count += 1
                 except Exception as e:
+                    # Optional: Log per-line error if needed
                     continue
     except Exception as e:
         return f"[Error] Failed {file_path.name}: {e}"
 
+    if count == 0:
+        output_path.unlink(missing_ok=True)
+        alignment_path.unlink(missing_ok=True)
+        return f"[Skipped] {file_path.name} — no valid documents found"
+
     return f"{file_path.name} — {count} lines transformed"
+
+
 
 
 def process_datasets_parallel(input_root, output_root, change_rate, sample_size=10, seed=42, model_path=None):
     """
-    Process multiple JSON files in parallel, transforming each.
-    Args:
-        input_root (str or Path): Directory with input JSON files.
-        output_root (str or Path): Directory to write transformed files.
-        change_rate (float): [0, 1] transformation intensity.
-        sample_size (int): Number of files to randomly sample and process.
-        seed (int): Random seed for reproducibility.
-        model_path (str): Path to FastText model file.
-    """
+    Process multiple JSON files in parallel, transforming each and recording alignments.
 
+    Args:
+        input_root: Directory containing input JSON files.
+        output_root: Directory to write transformed JSON files. 
+        change_rate: Probability of applying transformations.
+        sample_size: Number of files to process.
+        seed: Random seed for reproducibility.
+        model_path: Path to the FastText model. 
+    """
     input_root = Path(input_root)
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
+
+    alignment_dir = output_root / "alignments"
+    alignment_dir.mkdir(parents=True, exist_ok=True)
 
     all_files = list(input_root.glob("*.json"))
     if not all_files:
@@ -356,10 +367,10 @@ def process_datasets_parallel(input_root, output_root, change_rate, sample_size=
     random.seed(seed)
     selected = random.sample(all_files, min(sample_size, len(all_files)))
 
-    print(f"[INFO] Selected {len(selected)} of {len(all_files)} files using seed {seed}.")
+    print(f"[INFO] Selected {len(selected)} of {len(all_files)} files using seed {seed}.", flush=True)
 
     args_list = [
-        (file, output_root, model_path, change_rate, seed)
+        (file, output_root, alignment_dir, model_path, change_rate, seed)
         for file in selected
     ]
 
@@ -369,11 +380,11 @@ def process_datasets_parallel(input_root, output_root, change_rate, sample_size=
             print(future.result())
 
 
-
 def main():
+    start_time = time.time()
     
     if len(sys.argv) < 3:
-        print("Usage: python transform_json.py <input_dir> <output_dir> [change_rate]")
+        print("Usage: python transform_json.py <input_dir> <output_dir> [change_rate]", flush=True)
         sys.exit(1)
 
     input_dir = sys.argv[1]
@@ -385,11 +396,14 @@ def main():
         input_root=input_dir,
         output_root=output_dir,
         change_rate=change_rate,
-        sample_size=10,
+        sample_size=100,
         seed=42,
         model_path=model_path,
     )
 
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    print(f"Total time taken: {elapsed_time:.2f} seconds",  flush=True)
 
 
 if __name__ == "__main__":
