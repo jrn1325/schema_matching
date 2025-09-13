@@ -1,412 +1,200 @@
-
-from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from difflib import SequenceMatcher
-from pathlib import Path
-from sklearn.neighbors import NearestNeighbors
-
-from gensim.models import KeyedVectors
-import gensim.downloader as api
+import argparse
 import json
-import inflect
-import numpy as np
-import os
 import random
-import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import lru_cache
+from pathlib import Path
+from transformers import AutoTokenizer, AutoModelForMaskedLM, pipeline
 
-inflector = inflect.engine()
+MODEL_NAME = "bert-base-uncased"
 
-# lingustic change functions
-def load_fasttext_model(local_path="fasttext.model"):
+# ----------------------------
+# Model loading
+# ----------------------------
+def load_model(model_name=MODEL_NAME):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForMaskedLM.from_pretrained(model_name)
+    return pipeline("fill-mask", model=model, tokenizer=tokenizer)
+
+fill_mask = None
+
+# ----------------------------
+# Modification functions
+# ----------------------------
+
+def flatten_object(obj, parent_key="", sep="."):
     """
-    Load FastText word embedding model.
-    - If the model file exists locally, load it from disk.
-    - Otherwise, download it from Gensim and save for future use.
-
-    Args:
-        local_path (str): Path to saved model file.
-
-    Returns:
-        Gensim KeyedVectors model.
+    Flatten nested JSON objects into a single JSON with dot notation keys.
+    Arrays stay intact, but objects inside arrays are also flattened.
     """
-    if os.path.exists(local_path):
-        print(f"Loading FastText model from: {local_path}")
-        return KeyedVectors.load(local_path)
-    
-    print("Downloading FastText model from Gensim API...")
-    model = api.load("fasttext-wiki-news-subwords-300")
-    model.save(local_path)
-    print(f"Model saved to: {local_path}")
-    return model
+    out = {}
+    stack = [(obj, parent_key)]
 
+    while stack:
+        current, current_key = stack.pop()
+        if isinstance(current, dict):
+            for k, v in current.items():
+                new_key = f"{current_key}{sep}{k}" if current_key else k
+                if isinstance(v, dict):
+                    stack.append((v, new_key))
+                elif isinstance(v, list):
+                    new_list = []
+                    for item in v:
+                        if isinstance(item, dict):
+                            new_list.append(flatten_object(item, parent_key=new_key, sep=sep))
+                        else:
+                            new_list.append(item)
+                    out[new_key] = new_list
+                else:
+                    out[new_key] = v
+        else:
+            out[current_key] = current
 
-def build_vocab_index(model, max_words=100000):
+    return out
+
+@lru_cache(maxsize=None)
+def get_synonym(word):
     """
-    Build a vocabulary list and KNN index from the embedding model.
-
-    Args:
-        model: The pretrained FastText model.
-        max_words: Maximum number of words to index for performance.
-
-    Returns:
-        vocab: List of vocabulary words.
-        vectors: Corresponding word vectors.
-        index: NearestNeighbors index for similarity search.
+    Get a synonym for the given word using CodeBERT masked LM.
     """
-    vocab = model.index_to_key[:max_words]
-    vectors = np.array([model[word] for word in vocab])
-    index = NearestNeighbors(n_neighbors=6, metric="cosine").fit(vectors)
-    return vocab, vectors, index
-
-
-def is_plural_form(base, candidate):
-    """
-    Check if candidate is a plural or singular form of base.
-    Args:
-        base: The base word.
-        candidate: The candidate word to check.
-    Returns:
-        True if candidate is a plural/singular form of base, else False.
-    """
-    return inflector.singular_noun(candidate) == base or inflector.plural_noun(base) == candidate
-
-
-def is_too_similar(a, b, threshold=0.85):
-    """
-    Check if two words are too morphologically similar (e.g., 'create' vs 'created').
-    Args:
-        a: First word.
-        b: Second word.
-        threshold: Similarity ratio above which words are considered too similar.
-    Returns:
-        True if words are too similar, else False.
-    """
-    return SequenceMatcher(None, a, b).ratio() > threshold
-
-
-def find_synonym(word, model, vocab, index, vectors):
-    """
-    Find a near-synonym based on vector similarity,
-    excluding trivial variants (e.g., plural forms or near-identical matches).
-
-    Args:
-        word: The original word to find a synonym for.
-        model: The pretrained FastText model.
-        vocab: List of vocabulary words used in the KNN index.
-        index: NearestNeighbors index built from FastText vectors.
-        vectors: Corresponding FastText vectors.
-
-    Returns:
-        A synonym word, or the original word if no suitable synonym is found.
-    """
-    word = word.lower()
-    if word not in model:
-        return word
-
-    word_vec = model[word].reshape(1, -1)
-
-    # Find nearest neighbors
-    _, indices = index.kneighbors(word_vec)
-
-    for idx in indices[0]:
-        candidate = vocab[idx]
-        if (candidate.lower() != word and
-            not is_plural_form(word, candidate) and
-            not is_too_similar(word, candidate)):
+    global fill_mask
+    fill_mask = load_model() if fill_mask is None else fill_mask
+    text = f"The {word} is called [MASK]."
+    preds = fill_mask(text, top_k=5)
+    # Pick first prediction that is different from original
+    for p in preds:
+        candidate = p["token_str"].strip().replace("_", " ")
+        if candidate.lower() != word.lower():
             return candidate
-
     return word
 
-
-def rename_key(key, model, vocab, index, vectors, change_rate):
+def rename_keys(doc, output_file):
     """
-    Rename a key using synonym-based renaming based on change rate.
-
-    Args:
-        key: The original key.
-        model, vocab, index, vectors: FastText-related objects.
-        change_rate: Probability of applying transformation (0 to 1).
-
-    Returns:
-        A renamed (possibly unchanged) camelCase version of the key.
+    Rename keys with synonyms and return both new doc and mapping.
     """
-    if random.random() > change_rate:
-        return key
-    parts = key.split('_')
-    new_parts = [find_synonym(part, model, vocab, index, vectors) for part in parts]
-    return ''.join([new_parts[0]] + [p.capitalize() for p in new_parts[1:]])
+    renamed = {}
+    mapping = []
 
+    for key_path, v in doc.items():
+        parts = key_path.split(".")
+        key = parts[-1]
+        synonym = get_synonym(key)
+        new_key_path = ".".join(parts[:-1] + [synonym])
+        renamed[new_key_path] = v
 
+        mapping.append({
+            "filename": str(output_file),
+            "original_key_path": key_path,
+            "new_key_path": new_key_path,
+            "original_key": key,
+            "synonym": synonym
+        })
+    return renamed, mapping
 
-# structural change functions
-def group_keys_by_prefix(flat_dict, change_rate):
+def flatten_documents(docs, output_file, groundtruth_file):
     """
-    Group flat keys into nested structures based on shared prefix.
-
-    Args:
-        flat_dict: A dictionary of flat keys.
-        change_rate: Probability of grouping keys into sub-objects.
-
-    Returns:
-        grouped: Dict of nested keys by prefix.
-        others: Dict of keys not grouped.
-    """
-    grouped = defaultdict(dict)
-    others = {}
-    for k, v in flat_dict.items():
-        parts = k.split('_', 1)
-        if len(parts) == 2 and random.random() < change_rate:
-            prefix, subkey = parts
-            grouped[prefix][subkey] = v
-        else:
-            others[k] = v
-    return grouped, others
-
-
-def nest_flat_structure(data, change_rate):
-    """
-    Recursively nest flat key structures using prefix grouping.
-
-    Args:
-        data: A (partially) flat dictionary.
-        change_rate: How aggressively to group keys into nested dicts.
-
-    Returns:
-        A new dictionary with optionally nested substructures.
-    """
-    if not isinstance(data, dict):
-        return data
-    grouped, others = group_keys_by_prefix(data, change_rate)
-    result = {}
-    for prefix, subdict in grouped.items():
-        nested = nest_flat_structure(subdict, change_rate)
-        result[prefix] = nested
-    for k, v in others.items():
-        result[k] = nest_flat_structure(v, change_rate) if isinstance(v, dict) else v
-    return result
-
-
-def flatten_nested_structure(nested_dict, parent_key="", sep="_", change_rate=1.0):
-    """
-    Recursively flatten nested dictionaries into a single-level dict with concatenated keys.
-    Args:
-        nested_dict: The nested dictionary to flatten.
-        parent_key: The base key string for recursion.
-        sep: Separator between concatenated keys.
-        change_rate: Probability of flattening a nested dict.
-    Returns:
-        A flat dictionary with concatenated keys.
-    """
-    if not isinstance(nested_dict, dict):
-        return nested_dict  
+    Flatten a list of JSON documents and write them line by line to JSONL.
     
-    items = {}
-    for k, v in nested_dict.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
-        if isinstance(v, dict) and random.random() < change_rate:
-            subitems = flatten_nested_structure(v, new_key, sep=sep, change_rate=change_rate)
-            for sub_k, sub_v in subitems.items():
-                if sub_k in items:
-                    raise ValueError(f"Key collision when flattening: {sub_k}")
-                items[sub_k] = sub_v
-        else:
-            if new_key in items:
-                raise ValueError(f"Key collision when flattening: {new_key}")
-            items[new_key] = v
-    return items
-
-
-def is_flat_dict(d):
-    """
-    Returns True if all values are scalar or non-dict types (not just at top level).
-
     Args:
-        d: The dictionary to check.
-    Returns:
-        True if all values are non-dict types, else False.
+        docs (list): List of JSON documents.
+        output_file (str): Path to output JSONL file.
     """
-    if not isinstance(d, dict):
-        return False
-    return all(not isinstance(v, dict) for v in d.values())
+    all_mappings = []
+    with open(output_file, "w", encoding="utf-8") as f:
+        for doc in docs:
+            flat_doc = flatten_object(doc)
+            renamed_doc, mapping = rename_keys(flat_doc, output_file)
+            f.write(json.dumps(renamed_doc) + "\n")
+            all_mappings.extend(mapping)
+
+    # Save groundtruth mappings
+    with open(groundtruth_file, "a", encoding="utf-8") as f:
+        for map_entry in all_mappings:
+            f.write(json.dumps(map_entry) + "\n")
 
 
-def nest_or_flatten(data, change_rate=1.0):
-    """
-    If the data is flat, nest it. If the data is nested, flatten it.
-    Args:
-        data: Input JSON-like object (dict or list).
-        change_rate: Float [0, 1] for how aggressively to transform.
-    Returns:    
-        Transformed JSON object.
-    """
-    if isinstance(data, dict) and all(isinstance(k, str) and "_" in k for k in data.keys()):
-        return nest_flat_structure(data, change_rate)
-    elif isinstance(data, dict) and any(isinstance(v, dict) for v in data.values()):
-        return flatten_nested_structure(data, change_rate=change_rate)
-    else:
-        return data
-    
+# ----------------------------
+# File processing functions
+# ----------------------------
 
-def restructure_doc(data, model, vocab, index, vectors, change_rate, alignment, parent_key=""):
-    """
-    Apply dynamic key renaming and optional structural nesting, while tracking alignments.
-
-    Args:
-        data: Input JSON-like object (dict or list).
-        model, vocab, index, vectors: FastText-related objects.
-        change_rate: Float [0, 1] for how aggressively to transform.
-        alignment: Dict for recording key mappings (source_path → target_path).
-        parent_key: Tracks current JSON path recursively.
-
-    Returns:
-        Transformed JSON object.
-    """
-    if isinstance(data, dict):
-        renamed = {}
-        for k, v in data.items():
-            new_k = rename_key(k, model, vocab, index, vectors, change_rate)
-            full_src_path = f"{parent_key}.{k}" if parent_key else k
-            full_tgt_path = f"{parent_key}.{new_k}" if parent_key else new_k
-            alignment[full_src_path] = full_tgt_path
-
-            new_v = restructure_doc(v, model, vocab, index, vectors, change_rate, alignment, full_tgt_path)
-            renamed[new_k] = new_v
-        return nest_or_flatten(renamed, change_rate)
-
-    elif isinstance(data, list):
-        return [restructure_doc(item, model, vocab, index, vectors, change_rate, alignment, parent_key) for item in data]
-
-    else:
-        return data
-
-
-# file processing functions
-def read_lines(file):
-    """
-    Read lines from a file, handling exceptions.
-    Args:
-        file: Path to the file.
-    Returns:
-        List of lines, or empty list on error.
-    """ 
+def split_docs(file_path):
+    """Split JSON file into two halves of documents."""
     try:
-        with open(file, 'r') as f:
-            return f.readlines()
-    except Exception as e:
-        print(f"[Error] Failed to read {file}: {e}")
-        return []
+        with open(file_path, "r", encoding="utf-8") as f:
+            docs = [json.loads(line) for line in f if line.strip()]
+    except json.JSONDecodeError:
+        print(f"[Error] Invalid JSON in {file_path}", flush=True)
+        return [], []
+    mid = len(docs) // 2
+    return docs[:mid], docs[mid:]
 
-
-def process_one_file(file_path, output_dir, alignment_dir, model_path, change_rate, seed):
-    random.seed(seed + hash(file_path) % 10000)
-
-    model = load_fasttext_model(model_path)
-    vocab, vectors, index = build_vocab_index(model)
-
+def process_one_file(file_path, output_dir, groundtruth_file):
     output_path = output_dir / file_path.name
-    alignment_path = alignment_dir / (file_path.stem + ".alignments.json")
 
-    count = 0
+    # Split data into source and target documents
+    source_docs, target_docs = split_docs(file_path)
+    if not source_docs or not target_docs:
+        return f"[Skipped] {file_path.name} — not enough documents to split"
 
-    try:
-        with open(file_path, 'r') as fin:
-            lines = [line.strip() for line in fin if line.strip()]
-            if not lines:
-                return f"[Skipped] {file_path.name} — empty or invalid file"
+    # Flatten the objects in the target documents
+    flatten_documents(target_docs, output_path, groundtruth_file)
 
-        with open(output_path, 'w') as fout, open(alignment_path, 'w') as aout:
-            for line in lines:
-                try:
-                    doc = json.loads(line)
-                    alignment = {}
-                    transformed = restructure_doc(doc, model, vocab, index, vectors, change_rate, alignment)
-                    fout.write(json.dumps(transformed) + '\n')
-                    aout.write(json.dumps(alignment) + '\n')
-                    count += 1
-                except Exception as e:
-                    # Optional: Log per-line error if needed
-                    continue
-    except Exception as e:
-        return f"[Error] Failed {file_path.name}: {e}"
-
-    if count == 0:
-        output_path.unlink(missing_ok=True)
-        alignment_path.unlink(missing_ok=True)
-        return f"[Skipped] {file_path.name} — no valid documents found"
-
-    return f"{file_path.name} — {count} lines transformed"
-
-
-
-
-def process_datasets_parallel(input_root, output_root, change_rate, sample_size=10, seed=42, model_path=None):
-    """
-    Process multiple JSON files in parallel, transforming each and recording alignments.
-
-    Args:
-        input_root: Directory containing input JSON files.
-        output_root: Directory to write transformed JSON files. 
-        change_rate: Probability of applying transformations.
-        sample_size: Number of files to process.
-        seed: Random seed for reproducibility.
-        model_path: Path to the FastText model. 
-    """
-    input_root = Path(input_root)
-    output_root = Path(output_root)
+def process_datasets_parallel(input_root, output_root, groundtruth_file, sample_size=2, seed=101):
+    input_root, output_root, groundtruth_file = Path(input_root), Path(output_root), Path(groundtruth_file)
     output_root.mkdir(parents=True, exist_ok=True)
+    groundtruth_file.parent.mkdir(parents=True, exist_ok=True)
 
-    alignment_dir = output_root / "alignments"
-    alignment_dir.mkdir(parents=True, exist_ok=True)
+    all_files = list(Path(input_root).glob("*.json"))
 
-    all_files = list(input_root.glob("*.json"))
     if not all_files:
-        print("No JSON files found in input directory.")
+        print("No input files found.")
         return
 
+    # Pick a random sample of files to process
     random.seed(seed)
     selected = random.sample(all_files, min(sample_size, len(all_files)))
-
-    print(f"[INFO] Selected {len(selected)} of {len(all_files)} files using seed {seed}.", flush=True)
+    print(f"Processing {len(selected)} files...")
 
     args_list = [
-        (file, output_root, alignment_dir, model_path, change_rate, seed)
+        (file, output_root, groundtruth_file)
         for file in selected
     ]
 
     with ProcessPoolExecutor() as executor:
         futures = [executor.submit(process_one_file, *args) for args in args_list]
         for future in as_completed(futures):
-            print(future.result())
+            result = future.result()
+            if result:
+                print(result)
+
+# ----------------------------
+# CLI entrypoint
+# ----------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(description="Transform JSON with synonym-based key renaming.")
+    parser.add_argument("input_dir")
+    parser.add_argument("output_dir")
+    parser.add_argument("groundtruth_file", help="File to store groundtruth mappings")
+    parser.add_argument("--sample_size", type=int, default=2, help="Number of files to process")
+    parser.add_argument("--seed", type=int, default=101, help="Random seed")
+    return parser.parse_args()
 
 
 def main():
-    start_time = time.time()
-    
-    if len(sys.argv) < 3:
-        print("Usage: python transform_json.py <input_dir> <output_dir> [change_rate]", flush=True)
-        sys.exit(1)
-
-    input_dir = sys.argv[1]
-    output_dir = sys.argv[2]
-    change_rate = float(sys.argv[3]) if len(sys.argv) > 3 else 0.5
-    model_path = "fasttext.model"
+    args = parse_args()
+    start = time.time()
 
     process_datasets_parallel(
-        input_root=input_dir,
-        output_root=output_dir,
-        change_rate=change_rate,
-        sample_size=100,
-        seed=42,
-        model_path=model_path,
+        input_root=args.input_dir,
+        output_root=args.output_dir,
+        groundtruth_file=args.groundtruth_file,
+        sample_size=args.sample_size,
+        seed=args.seed,
     )
 
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"Total time taken: {elapsed_time:.2f} seconds",  flush=True)
+    print(f"Finished in {time.time() - start:.2f} seconds.")
 
 
 if __name__ == "__main__":
     main()
-
-
