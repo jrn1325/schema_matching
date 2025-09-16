@@ -1,23 +1,35 @@
 import argparse
 import json
 import random
+import re
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import lru_cache
+from gemma import gm
 from pathlib import Path
-from transformers import AutoTokenizer, AutoModelForMaskedLM, pipeline
 
-MODEL_NAME = "bert-base-uncased"
+# Global variable to hold sampler
+_sampler = None
 
 # ----------------------------
 # Model loading
 # ----------------------------
-def load_model(model_name=MODEL_NAME):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForMaskedLM.from_pretrained(model_name)
-    return pipeline("fill-mask", model=model, tokenizer=tokenizer)
+def load_model():
+    """Load and return the Gemma chat sampler.
+    Uses a global variable to avoid reloading in the same process.
+    
+    Returns:
+        gm.text.ChatSampler: The loaded chat sampler.
+    """
+    global _sampler
+    if _sampler is not None:
+        return _sampler
+    model = gm.nn.Gemma3_4B()
+    params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
+    sampler = gm.text.ChatSampler(model=model, params=params)
+    _sampler = sampler
+    return sampler
 
-fill_mask = None
 
 # ----------------------------
 # Modification functions
@@ -56,22 +68,25 @@ def flatten_object(obj, parent_key="", sep="."):
 @lru_cache(maxsize=None)
 def get_synonym(word):
     """
-    Get a synonym for the given word using CodeBERT masked LM.
+    Get a synonym for the given word using Gemma.
+
+    Args:
+        word (str): The word to find a synonym for.
+    Returns:
+        str: A synonym for the word.
     """
-    global fill_mask
-    fill_mask = load_model() if fill_mask is None else fill_mask
-    text = f"The {word} is called [MASK]."
-    preds = fill_mask(text, top_k=5)
-    # Pick first prediction that is different from original
-    for p in preds:
-        candidate = p["token_str"].strip().replace("_", " ")
-        if candidate.lower() != word.lower():
-            return candidate
-    return word
+    sampler = load_model()
+    prompt = f"Give me a synonym for '{word}'. The result should be something a developer might use as a key in a JSON document. Give me only this identifier as the result and nothing else"
+    return sampler.chat(prompt).strip()
 
 def rename_keys(doc, output_file):
     """
     Rename keys with synonyms and return both new doc and mapping.
+    Args:
+        doc (dict): The flattened JSON document.
+        output_file (str): The output file path for reference in mapping.
+    Returns:
+        tuple: (renamed document, mapping list)
     """
     renamed = {}
     mapping = []
@@ -119,7 +134,14 @@ def flatten_documents(docs, output_file, groundtruth_file):
 # ----------------------------
 
 def split_docs(file_path):
-    """Split JSON file into two halves of documents."""
+    """
+    Split JSON file into two halves of documents.
+    
+    Args:
+        file_path (str): Path to the JSON file.
+    Returns:
+        tuple: (list of source documents, list of target documents)
+    """
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             docs = [json.loads(line) for line in f if line.strip()]
@@ -140,7 +162,7 @@ def process_one_file(file_path, output_dir, groundtruth_file):
     # Flatten the objects in the target documents
     flatten_documents(target_docs, output_path, groundtruth_file)
 
-def process_datasets_parallel(input_root, output_root, groundtruth_file, sample_size=2, seed=101):
+def process_datasets_parallel(input_root, output_root, groundtruth_file, sample_size=1, seed=101):
     input_root, output_root, groundtruth_file = Path(input_root), Path(output_root), Path(groundtruth_file)
     output_root.mkdir(parents=True, exist_ok=True)
     groundtruth_file.parent.mkdir(parents=True, exist_ok=True)
