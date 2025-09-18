@@ -107,7 +107,40 @@ def rename_keys(doc, output_file):
         })
     return renamed, mapping
 
-def flatten_documents(docs, output_file, groundtruth_file):
+def split_compound_key(key):
+    """
+    Split a key into [verb, concept].
+    Keeps compound concepts together.
+    """
+    match = re.search(r'[a-z](?=[A-Z])', key)  # lowercase followed by uppercase
+    if match:
+        idx = match.start() + 1
+        return [key[:idx], key[idx:]]
+    else:
+        return [key]
+
+def split_top_level_keys(obj):
+    """
+    Split only top-level keys if their values are atomic (not dict/list).
+    """
+    new_obj = {}
+    for k, v in obj.items():
+        if not isinstance(v, (dict, list)):
+            parts = split_compound_key(k)
+        else:
+            parts = [k]
+
+        if len(parts) > 1:
+            d = new_obj
+            for p in parts[:-1]:
+                d = d.setdefault(p, {})
+            d[parts[-1]] = v
+        else:
+            new_obj[k] = v
+
+    return new_obj
+    
+def modify_documents(docs, output_file, groundtruth_file):
     """
     Flatten a list of JSON documents and write them line by line to JSONL.
     
@@ -118,8 +151,9 @@ def flatten_documents(docs, output_file, groundtruth_file):
     all_mappings = []
     with open(output_file, "w", encoding="utf-8") as f:
         for doc in docs:
-            flat_doc = flatten_object(doc)
-            renamed_doc, mapping = rename_keys(flat_doc, output_file)
+            #flat_doc = flatten_object(doc)
+            new_doc = split_top_level_keys(doc)
+            renamed_doc, mapping = rename_keys(new_doc, output_file)
             f.write(json.dumps(renamed_doc) + "\n")
             all_mappings.extend(mapping)
 
@@ -129,6 +163,7 @@ def flatten_documents(docs, output_file, groundtruth_file):
             f.write(json.dumps(map_entry) + "\n")
 
 
+    
 # ----------------------------
 # File processing functions
 # ----------------------------
@@ -136,7 +171,7 @@ def flatten_documents(docs, output_file, groundtruth_file):
 def split_docs(file_path):
     """
     Split JSON file into two halves of documents.
-    
+
     Args:
         file_path (str): Path to the JSON file.
     Returns:
@@ -160,7 +195,7 @@ def process_one_file(file_path, output_dir, groundtruth_file):
         return f"[Skipped] {file_path.name} — not enough documents to split"
 
     # Flatten the objects in the target documents
-    flatten_documents(target_docs, output_path, groundtruth_file)
+    modify_documents(target_docs, output_path, groundtruth_file)
 
 def process_datasets_parallel(input_root, output_root, groundtruth_file, sample_size=1, seed=101):
     input_root, output_root, groundtruth_file = Path(input_root), Path(output_root), Path(groundtruth_file)
