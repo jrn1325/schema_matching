@@ -1,118 +1,84 @@
 import argparse
+import google.genai as genai
 import json
 import random
 import re
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import lru_cache
-from gemma import gm
+
 from pathlib import Path
-
-# Global variable to hold sampler
-_sampler = None
+from tqdm import tqdm
 
 # ----------------------------
-# Model loading
+# Synonym generation
 # ----------------------------
-def load_model():
-    """Load and return the Gemma chat sampler.
-    Uses a global variable to avoid reloading in the same process.
-    
+def build_synonym_mapping(unique_keys, batch_size=64, model="gemini-2.5-flash"):
+    """
+    Build a mapping from keys to single-word JSON-friendly synonyms using Google Gemini.
+    Processes multiple keys per API call for efficiency.
+
+    Args:
+        unique_keys (set): Set of unique JSON keys to generate synonyms for.
+        batch_size (int): Number of keys to process in each API call.
+        model (str): The Gemini model to use.
     Returns:
-        gm.text.ChatSampler: The loaded chat sampler.
+        dict: Mapping from original keys to their synonyms.
     """
-    global _sampler
-    if _sampler is not None:
-        return _sampler
-    model = gm.nn.Gemma3_4B()
-    params = gm.ckpts.load_params(gm.ckpts.CheckpointPath.GEMMA3_4B_IT)
-    sampler = gm.text.ChatSampler(model=model, params=params)
-    _sampler = sampler
-    return sampler
+    # Initialize the Gemini client once
+    client = genai.Client() 
 
+    synonym_map = {}
+    keys = list(unique_keys)
 
-# ----------------------------
-# Modification functions
-# ----------------------------
+    for i in tqdm(range(0, len(keys), batch_size), desc="Building synonyms"):
+        batch_keys = keys[i:i+batch_size]
 
-def flatten_object(obj, parent_key="", sep="."):
-    """
-    Flatten nested JSON objects into a single JSON with dot notation keys.
-    Arrays stay intact, but objects inside arrays are also flattened.
-    """
-    out = {}
-    stack = [(obj, parent_key)]
+        # Global numbering for clarity in the prompt
+        prompt_lines = [
+            f"{i + j + 1}. Key: '{key}' → Synonym:" for j, key in enumerate(batch_keys)
+        ]
+        prompt = (
+            "Provide a synonym for each JSON key below."
+            "Return **only one word per line**, no extra text, in the same order:\n" +
+            "\n".join(prompt_lines)
+        )
 
-    while stack:
-        current, current_key = stack.pop()
-        if isinstance(current, dict):
-            for k, v in current.items():
-                new_key = f"{current_key}{sep}{k}" if current_key else k
-                if isinstance(v, dict):
-                    stack.append((v, new_key))
-                elif isinstance(v, list):
-                    new_list = []
-                    for item in v:
-                        if isinstance(item, dict):
-                            new_list.append(flatten_object(item, parent_key=new_key, sep=sep))
-                        else:
-                            new_list.append(item)
-                    out[new_key] = new_list
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+
+            # Process response safely
+            for key, line in zip(batch_keys, response.text.split("\n")):
+                clean_line = line.strip()
+                if not clean_line:
+                    synonym = key  # fallback if line is empty
                 else:
-                    out[new_key] = v
-        else:
-            out[current_key] = current
+                    synonym = "".join(c for c in clean_line if c.isalnum() or c == "_")
+                synonym_map[key] = synonym
 
-    return out
+        except Exception as e:
+            print(f"Error generating batch synonyms (keys {batch_keys}): {e}")
+            # Fallback: use original keys
+            for key in batch_keys:
+                synonym_map[key] = key
 
-@lru_cache(maxsize=None)
-def get_synonym(word):
-    """
-    Get a synonym for the given word using Gemma.
+    return synonym_map
 
-    Args:
-        word (str): The word to find a synonym for.
-    Returns:
-        str: A synonym for the word.
-    """
-    sampler = load_model()
-    prompt = f"Give me a synonym for '{word}'. The result should be something a developer might use as a key in a JSON document. Give me only this identifier as the result and nothing else"
-    return sampler.chat(prompt).strip()
 
-def rename_keys(doc, output_file):
-    """
-    Rename keys with synonyms and return both new doc and mapping.
-    Args:
-        doc (dict): The flattened JSON document.
-        output_file (str): The output file path for reference in mapping.
-    Returns:
-        tuple: (renamed document, mapping list)
-    """
-    renamed = {}
-    mapping = []
-
-    for key_path, v in doc.items():
-        parts = key_path.split(".")
-        key = parts[-1]
-        synonym = get_synonym(key)
-        new_key_path = ".".join(parts[:-1] + [synonym])
-        renamed[new_key_path] = v
-
-        mapping.append({
-            "filename": str(output_file),
-            "original_key_path": key_path,
-            "new_key_path": new_key_path,
-            "original_key": key,
-            "synonym": synonym
-        })
-    return renamed, mapping
-
+# ----------------------------
+# JSON key splitting and renaming
+# ----------------------------
 def split_compound_key(key):
+    """Split a compound key into its constituent parts.
+
+    Args:
+        key (str): The compound key to split.
+
+    Returns:
+        list: List of key parts.
     """
-    Split a key into [verb, concept].
-    Keeps compound concepts together.
-    """
-    match = re.search(r'[a-z](?=[A-Z])', key)  # lowercase followed by uppercase
+    match = re.search(r'[a-z](?=[A-Z])', key)
     if match:
         idx = match.start() + 1
         return [key[:idx], key[idx:]]
@@ -120,138 +86,216 @@ def split_compound_key(key):
         return [key]
 
 def split_top_level_keys(obj):
-    """
-    Split only top-level keys if their values are atomic (not dict/list).
+    """Split top-level keys into separate parts.
+
+    Args:
+        obj (dict): The JSON object to process.
+
+    Returns:
+        dict: The transformed JSON object with split keys.
     """
     new_obj = {}
     for k, v in obj.items():
         if not isinstance(v, (dict, list)):
             parts = split_compound_key(k)
-        else:
-            parts = [k]
-
-        if len(parts) > 1:
-            d = new_obj
-            for p in parts[:-1]:
-                d = d.setdefault(p, {})
-            d[parts[-1]] = v
-        else:
-            new_obj[k] = v
-
+            if len(parts) > 1:
+                d = new_obj
+                conflict = False
+                for p in parts[:-1]:
+                    if p in d and not isinstance(d[p], dict):
+                        conflict = True
+                        break
+                    d = d.setdefault(p, {})
+                if not conflict:
+                    d[parts[-1]] = v
+                    continue
+        new_obj[k] = v
     return new_obj
-    
-def modify_documents(docs, output_file, groundtruth_file):
-    """
-    Flatten a list of JSON documents and write them line by line to JSONL.
-    
-    Args:
-        docs (list): List of JSON documents.
-        output_file (str): Path to output JSONL file.
-    """
-    all_mappings = []
-    with open(output_file, "w", encoding="utf-8") as f:
-        for doc in docs:
-            #flat_doc = flatten_object(doc)
-            new_doc = split_top_level_keys(doc)
-            renamed_doc, mapping = rename_keys(new_doc, output_file)
-            f.write(json.dumps(renamed_doc) + "\n")
-            all_mappings.extend(mapping)
 
-    # Save groundtruth mappings
-    with open(groundtruth_file, "a", encoding="utf-8") as f:
-        for map_entry in all_mappings:
-            f.write(json.dumps(map_entry) + "\n")
-
-
-    
-# ----------------------------
-# File processing functions
-# ----------------------------
-
-def split_docs(file_path):
-    """
-    Split JSON file into two halves of documents.
+def rename_keys_recursive(obj, synonym_map):
+    """Recursively rename keys in a JSON object using the synonym map.
 
     Args:
-        file_path (str): Path to the JSON file.
+        obj (dict or list): The JSON object or list to process.
+        synonym_map (dict): Mapping from original keys to synonyms.
     Returns:
-        tuple: (list of source documents, list of target documents)
+        dict or list: The transformed JSON object or list with renamed keys.
     """
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            docs = [json.loads(line) for line in f if line.strip()]
-    except json.JSONDecodeError:
-        print(f"[Error] Invalid JSON in {file_path}", flush=True)
-        return [], []
-    mid = len(docs) // 2
-    return docs[:mid], docs[mid:]
+    if isinstance(obj, dict):
+        return {synonym_map.get(k, k): rename_keys_recursive(v, synonym_map) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [rename_keys_recursive(i, synonym_map) for i in obj]
+    else:
+        return obj
 
-def process_one_file(file_path, output_dir, groundtruth_file):
+def transform_document(doc, synonym_map):
+    """Transform a JSON document by renaming keys and splitting top-level keys.
+    Args:
+        doc (dict): The JSON document to transform.
+        synonym_map (dict): Mapping from original keys to synonyms.
+    Returns:
+        dict: The transformed JSON document.
+    """
+    renamed = rename_keys_recursive(doc, synonym_map)
+    return split_top_level_keys(renamed)
+
+# ----------------------------
+# Groundtruth mapping
+# ----------------------------
+def build_mapping(original_doc, transformed_doc, output_file_name):
+    """Build a mapping from original keys to new keys in the transformed document.
+
+    Args:
+        original_doc (dict): The original JSON document.
+        transformed_doc (dict): The transformed JSON document.
+        output_file_name (str): The name of the output file.
+    Returns:
+        list: List of mapping entries.
+    """
+    mappings = []
+    seen = set()
+
+    for orig_key, orig_val in original_doc.items():
+        if not isinstance(orig_val, (dict, list)):
+            final_val = orig_val
+            path_stack = [(transformed_doc, [])]
+            found_path = None
+
+            while path_stack:
+                current_obj, current_path = path_stack.pop()
+                if isinstance(current_obj, dict):
+                    for k, v in current_obj.items():
+                        if v is final_val:
+                            found_path = current_path + [k]
+                            break
+                        elif isinstance(v, dict):
+                            path_stack.append((v, current_path + [k]))
+                    if found_path:
+                        break
+
+            new_key_path = ".".join(found_path) if found_path else orig_key
+            mapping = {
+                "filename": output_file_name,
+                "original_key_path": orig_key,
+                "new_key_path": new_key_path,
+                "original_key": orig_key
+            }
+            if tuple(mapping.items()) not in seen:
+                seen.add(tuple(mapping.items()))
+                mappings.append(mapping)
+
+    return mappings
+
+# ----------------------------
+# Utilities
+# ----------------------------
+def stream_json_file(file_path):
+    """Stream JSON objects from a file, one per line.
+    Args:
+        file_path (str or Path): Path to the JSON file.
+    Yields:
+        dict: JSON object.
+    """
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield json.loads(line)
+
+def collect_keys_from_file(file_path):
+    unique_keys = set()
+    for doc in stream_json_file(file_path):
+        stack = [doc]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, dict):
+                for k, v in current.items():
+                    unique_keys.add(k)
+                    stack.append(v)
+            elif isinstance(current, list):
+                stack.extend(current)
+    return unique_keys
+
+# ----------------------------
+# File processing
+# ----------------------------
+def process_one_file(file_path, output_dir, groundtruth_file, synonym_map):
     output_path = output_dir / file_path.name
+    seen_mappings = set()
+    all_mappings = []
 
-    # Split data into source and target documents
-    source_docs, target_docs = split_docs(file_path)
-    if not source_docs or not target_docs:
-        return f"[Skipped] {file_path.name} — not enough documents to split"
+    with open(output_path, "w", encoding="utf-8") as f_out, \
+         open(groundtruth_file, "a", encoding="utf-8") as f_gt:
 
-    # Flatten the objects in the target documents
-    modify_documents(target_docs, output_path, groundtruth_file)
+        for doc in tqdm(stream_json_file(file_path), desc=f"Processing {file_path.name}"):
+            transformed_doc = transform_document(doc, synonym_map)
+            mapping = build_mapping(doc, transformed_doc, file_path.stem)
 
-def process_datasets_parallel(input_root, output_root, groundtruth_file, sample_size=1, seed=101):
+            for m in mapping:
+                m_key = tuple(sorted(m.items()))
+                if m_key not in seen_mappings:
+                    seen_mappings.add(m_key)
+                    all_mappings.append(m)
+
+            f_out.write(json.dumps(transformed_doc) + "\n")
+
+        for map_entry in all_mappings:
+            f_gt.write(json.dumps(map_entry) + "\n")
+
+# ----------------------------
+# Dataset processing
+# ----------------------------
+def process_datasets(input_root, output_root, groundtruth_file, sample_size=1, seed=42, batch_size=8):
     input_root, output_root, groundtruth_file = Path(input_root), Path(output_root), Path(groundtruth_file)
     output_root.mkdir(parents=True, exist_ok=True)
     groundtruth_file.parent.mkdir(parents=True, exist_ok=True)
 
     all_files = list(Path(input_root).glob("*.json"))
-
     if not all_files:
         print("No input files found.")
         return
 
-    # Pick a random sample of files to process
     random.seed(seed)
-    selected = random.sample(all_files, min(sample_size, len(all_files)))
-    print(f"Processing {len(selected)} files...")
+    selected_files = random.sample(all_files, min(sample_size, len(all_files)))
+    print(f"Processing {len(selected_files)} files...", flush=True)
 
-    args_list = [
-        (file, output_root, groundtruth_file)
-        for file in selected
-    ]
+    # Step 1: Collect all unique keys from selected files
+    all_keys = set()
+    for file_path in tqdm(selected_files, desc="Collecting unique keys"):
+        all_keys.update(collect_keys_from_file(file_path))
 
-    with ProcessPoolExecutor() as executor:
-        futures = [executor.submit(process_one_file, *args) for args in args_list]
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                print(result)
+    # Step 2: Build synonym map safely on GPU
+    synonym_map = build_synonym_mapping(all_keys, batch_size=batch_size)
+
+    # Step 3: Process each file line by line
+    for file_path in tqdm(selected_files, desc="Transforming files"):
+        process_one_file(file_path, output_root, groundtruth_file, synonym_map)
 
 # ----------------------------
-# CLI entrypoint
+# CLI
 # ----------------------------
 def parse_args():
-    parser = argparse.ArgumentParser(description="Transform JSON with synonym-based key renaming.")
+    parser = argparse.ArgumentParser(description="Transform JSON with synonym-based key renaming and structural split.")
     parser.add_argument("input_dir")
     parser.add_argument("output_dir")
     parser.add_argument("groundtruth_file", help="File to store groundtruth mappings")
-    parser.add_argument("--sample_size", type=int, default=2, help="Number of files to process")
-    parser.add_argument("--seed", type=int, default=101, help="Random seed")
+    parser.add_argument("--sample_size", type=int, default=10, help="Number of files to process")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--batch_size", type=int, default=64, help="GPU batch size for synonym generation")
     return parser.parse_args()
-
 
 def main():
     args = parse_args()
     start = time.time()
-
-    process_datasets_parallel(
+    process_datasets(
         input_root=args.input_dir,
         output_root=args.output_dir,
         groundtruth_file=args.groundtruth_file,
         sample_size=args.sample_size,
         seed=args.seed,
+        batch_size=args.batch_size
     )
-
     print(f"Finished in {time.time() - start:.2f} seconds.")
-
 
 if __name__ == "__main__":
     main()
