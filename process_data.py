@@ -44,7 +44,14 @@ def parse_document(doc, path=''):
         yield (path, doc, 0)
 
 def normalize_value(value):
-    """Normalize value for consistent representation"""
+    """
+    Normalize value for consistent representation
+    
+    Args:
+        value: JSON value
+    Returns:
+        normalized string representation
+    """
     if isinstance(value, (str, int, float, bool, type(None))):
         return str(value)
     return json.dumps(value, sort_keys=True)
@@ -73,7 +80,8 @@ def infer_type(value):
     return "unknown"
 
 def key_entropy(keys):
-    """Compute entropy of keys in a dict
+    """
+    Compute entropy of keys in a dict
 
     Args:
         keys: list of keys
@@ -87,7 +95,8 @@ def key_entropy(keys):
     return -sum((count / total) * math.log2(count / total) for count in counter.values())
 
 def calc_embeddings(values, model, tokenizer, batch_size=64):
-    """Calculate embeddings for a list of values using a transformer model
+    """
+    Calculate embeddings for a list of values using a transformer model
 
     Args:
         values: list of string values
@@ -110,8 +119,9 @@ def calc_embeddings(values, model, tokenizer, batch_size=64):
     return avg_embedding
 
 def extract_paths(docs):
-    """Extract paths and their stats from a list of JSON documents
-    
+    """
+    Extract paths and their stats from a list of JSON documents.
+
     Args:
         docs: list of JSON documents
     Returns:
@@ -184,11 +194,18 @@ def extract_paths(docs):
     return final
 
 
-
 # ----------------------------
 # File processing
 # ----------------------------
 def process_file(file_path):
+    """
+    Process a single JSON file and extract path stats.
+
+    Args:
+        file_path: path to JSON file    
+    Returns:
+        dict of path stats
+    """
     file_path = Path(file_path)
     try:
         with open(file_path, encoding="utf-8") as f:
@@ -200,8 +217,16 @@ def process_file(file_path):
     stats = extract_paths(docs)
     return stats
 
-
 def process_files(source_dir, target_dir, source_output_csv, target_output_csv):
+    """
+    Process files in the source and target directories, extracting path stats and saving to CSV.
+
+    Args:
+        source_dir: directory with source JSON files
+        target_dir: directory with target JSON files
+        source_output_csv: output CSV file for source stats
+        target_output_csv: output CSV file for target stats
+    """
     source_dir = Path(source_dir)
     target_dir = Path(target_dir)
 
@@ -224,7 +249,7 @@ def process_files(source_dir, target_dir, source_output_csv, target_output_csv):
     ]:
         all_rows = []
 
-        for file_path in files:
+        for file_path in tqdm(files, desc=f"Processing {split_name} files", total=len(files)):
             print(f"Processing {split_name} file {file_path}...", flush=True)
 
             with open(file_path, encoding="utf-8") as f:
@@ -232,7 +257,7 @@ def process_files(source_dir, target_dir, source_output_csv, target_output_csv):
 
             path_stats = extract_paths(docs)
 
-            for path, stats in path_stats.items():
+            for path, stats in tqdm(path_stats.items(), desc=f"Processing {split_name} paths", total=len(path_stats)):
                 all_rows.append({
                     "filename": file_path.name,
                     "path": path,
@@ -256,8 +281,6 @@ def process_files(source_dir, target_dir, source_output_csv, target_output_csv):
             ], delimiter=";")
             writer.writeheader()
             writer.writerows(all_rows)
-
-
 
 
 # ----------------------------
