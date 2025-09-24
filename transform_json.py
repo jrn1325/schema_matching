@@ -1,5 +1,6 @@
 import argparse
 import google.genai as genai
+import hashlib
 import json
 import random
 import re
@@ -32,7 +33,6 @@ def build_synonym_mapping(unique_keys, batch_size=64, model="gemini-2.5-flash"):
     for i in tqdm(range(0, len(keys), batch_size), desc="Building synonyms"):
         batch_keys = keys[i:i+batch_size]
 
-        # Global numbering for clarity in the prompt
         prompt_lines = [
             f"{i + j + 1}. Key: '{key}' → Synonym:" for j, key in enumerate(batch_keys)
         ]
@@ -48,11 +48,11 @@ def build_synonym_mapping(unique_keys, batch_size=64, model="gemini-2.5-flash"):
                 contents=prompt,
             )
 
-            # Process response safely
+            # Process response
             for key, line in zip(batch_keys, response.text.split("\n")):
                 clean_line = line.strip()
                 if not clean_line:
-                    synonym = key  # fallback if line is empty
+                    synonym = key 
                 else:
                     synonym = "".join(c for c in clean_line if c.isalnum() or c == "_")
                 synonym_map[key] = synonym
@@ -70,7 +70,8 @@ def build_synonym_mapping(unique_keys, batch_size=64, model="gemini-2.5-flash"):
 # JSON key splitting and renaming
 # ----------------------------
 def split_compound_key(key):
-    """Split a compound key into its constituent parts.
+    """
+    Split a compound key into its constituent parts.
 
     Args:
         key (str): The compound key to split.
@@ -85,112 +86,153 @@ def split_compound_key(key):
     else:
         return [key]
 
-def split_top_level_keys(obj):
-    """Split top-level keys into separate parts.
-
-    Args:
-        obj (dict): The JSON object to process.
-
-    Returns:
-        dict: The transformed JSON object with split keys.
+def split_top_level_keys(obj, parent_path=None):
     """
-    new_obj = {}
-    for k, v in obj.items():
-        if not isinstance(v, (dict, list)):
-            parts = split_compound_key(k)
-            if len(parts) > 1:
-                d = new_obj
-                conflict = False
-                for p in parts[:-1]:
-                    if p in d and not isinstance(d[p], dict):
-                        conflict = True
-                        break
-                    d = d.setdefault(p, {})
-                if not conflict:
-                    d[parts[-1]] = v
-                    continue
-        new_obj[k] = v
-    return new_obj
-
-def rename_keys_recursive(obj, synonym_map):
-    """Recursively rename keys in a JSON object using the synonym map.
+    Split top-level compound keys into nested dicts/lists,
+    while keeping a mapping of old→new paths. 
+    List indices are replaced with '*'.
 
     Args:
-        obj (dict or list): The JSON object or list to process.
-        synonym_map (dict): Mapping from original keys to synonyms.
+        obj (dict or list): The JSON object to process.
+        parent_path (list): Internal use for recursive path tracking.
+
     Returns:
-        dict or list: The transformed JSON object or list with renamed keys.
+        tuple: (new_obj, mapping) where
+            - new_obj is the transformed JSON
+            - mapping is a dict {old_path_str: new_path_str}
+    """
+    if parent_path is None:
+        parent_path = []
+
+    mapping = {}
+
+    if isinstance(obj, dict):
+        new_obj = {}
+        for k, v in obj.items():
+            old_path = ".".join(parent_path + [k])
+            if not isinstance(v, (dict, list)):
+                parts = split_compound_key(k)
+                if len(parts) > 1:
+                    d = new_obj
+                    conflict = False
+                    for p in parts[:-1]:
+                        if p in d and not isinstance(d[p], dict):
+                            conflict = True
+                            break
+                        d = d.setdefault(p, {})
+                    if not conflict:
+                        d[parts[-1]] = v
+                        new_path = ".".join(parent_path + parts)
+                        mapping[old_path] = new_path
+                        continue
+            new_obj[k] = v
+            mapping[old_path] = old_path
+        return new_obj, mapping
+
+    elif isinstance(obj, list):
+        new_list = []
+        for item in obj:
+            # Use "*" to replace numeric index
+            transformed, submap = split_top_level_keys(item, parent_path + ["*"])
+            new_list.append(transformed)
+            mapping.update(submap)
+        return new_list, mapping
+
+    else:
+        # Primitive type → no key, just return value
+        return obj, {}
+
+def rename_keys_recursive(obj, synonym_map, linguistic_map):
+    """
+    Recursively rename keys in a JSON object using synonym_map,
+    keeping track of key renames.
+
+    Args:
+        obj (dict or list): The JSON object to process.
+        synonym_map (dict): Mapping from original keys to synonyms.
+        linguistic_map (dict): Internal use to track {old_key: new_key}.
+    Returns:
+        dict or list: The JSON object with renamed keys.
     """
     if isinstance(obj, dict):
-        return {synonym_map.get(k, k): rename_keys_recursive(v, synonym_map) for k, v in obj.items()}
+        new_obj = {}
+        for k, v in obj.items():
+            new_k = synonym_map.get(k, k)
+            if new_k != k:
+                linguistic_map[k] = new_k
+            new_obj[new_k] = rename_keys_recursive(v, synonym_map, linguistic_map)
+        return new_obj
     elif isinstance(obj, list):
-        return [rename_keys_recursive(i, synonym_map) for i in obj]
+        return [rename_keys_recursive(i, synonym_map, linguistic_map) for i in obj]
     else:
         return obj
 
-def transform_document(doc, synonym_map):
-    """Transform a JSON document by renaming keys and splitting top-level keys.
-    Args:
-        doc (dict): The JSON document to transform.
-        synonym_map (dict): Mapping from original keys to synonyms.
-    Returns:
-        dict: The transformed JSON document.
+def transform_document(doc, synonym_map, mode):
     """
-    renamed = rename_keys_recursive(doc, synonym_map)
-    return split_top_level_keys(renamed)
+    Transform a JSON document by applying either linguistic OR structural changes.
+
+    Args:
+        doc (dict): JSON document.
+        synonym_map (dict): Mapping from original keys to synonyms.
+        mode (str): "linguistic" or "structural".
+    Returns:
+        tuple: (transformed_doc, final_map, structure_map, linguistic_map)
+    """
+    linguistic_map, structure_map, final_map = {}, {}, {}
+
+    if mode == "linguistic":
+        # Apply only synonym renaming
+        renamed = rename_keys_recursive(doc, synonym_map, linguistic_map)
+        split_doc = renamed
+        # Identity mapping for unchanged keys
+        if isinstance(renamed, dict):
+            structure_map = {k: k for k in renamed.keys()}
+    elif mode == "structural":
+        # Apply only structural splitting
+        split_doc, structure_map = split_top_level_keys(doc)
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    # Merge into final_map
+    for old_key, new_key in linguistic_map.items():
+        if new_key in structure_map:
+            final_map[old_key] = structure_map[new_key]
+    for key, path in structure_map.items():
+        if key not in linguistic_map.values():
+            final_map[key] = path
+
+    return split_doc, final_map, structure_map, linguistic_map
+
 
 # ----------------------------
 # Groundtruth mapping
 # ----------------------------
-def build_mapping(original_doc, transformed_doc, output_file_name):
-    """Build a mapping from original keys to new keys in the transformed document.
+def save_final_map(final_map, filename, output_path, mode):
+    """
+    Save final mapping to a JSON file with filename and mode included.
 
     Args:
-        original_doc (dict): The original JSON document.
-        transformed_doc (dict): The transformed JSON document.
-        output_file_name (str): The name of the output file.
-    Returns:
-        list: List of mapping entries.
+        final_map (dict): Mapping from original → final paths.
+        filename (str): Name of the input dataset/file.
+        output_path (str): Path to save the JSON mapping file.
+        mode (str): Transformation type ("linguistic", "structural", "both").
     """
-    mappings = []
-    seen = set()
+    data = {
+        "filename": filename,
+        "mode": mode,
+        "mappings": final_map
+    }
+    with open(output_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(data) + "\n")
 
-    for orig_key, orig_val in original_doc.items():
-        if not isinstance(orig_val, (dict, list)):
-            final_val = orig_val
-            path_stack = [(transformed_doc, [])]
-            found_path = None
-
-            while path_stack:
-                current_obj, current_path = path_stack.pop()
-                if isinstance(current_obj, dict):
-                    for k, v in current_obj.items():
-                        if v is final_val:
-                            found_path = current_path + [k]
-                            break
-                        elif isinstance(v, dict):
-                            path_stack.append((v, current_path + [k]))
-                    if found_path:
-                        break
-
-            new_key_path = ".".join(found_path) if found_path else orig_key
-            mapping = {
-                "filename": output_file_name,
-                "original_key_path": orig_key,
-                "new_key_path": new_key_path,
-                "original_key": orig_key
-            }
-            if tuple(mapping.items()) not in seen:
-                seen.add(tuple(mapping.items()))
-                mappings.append(mapping)
-
-    return mappings
 
 # ----------------------------
 # Utilities
 # ----------------------------
 def stream_json_file(file_path):
-    """Stream JSON objects from a file, one per line.
+    """
+    Stream JSON objects from a file, one per line.
+
     Args:
         file_path (str or Path): Path to the JSON file.
     Yields:
@@ -203,6 +245,14 @@ def stream_json_file(file_path):
                 yield json.loads(line)
 
 def collect_keys_from_file(file_path):
+    """
+    Collect all unique keys from a JSON file.
+
+    Args:
+        file_path (str or Path): Path to the JSON file.
+    Returns:
+        set: Set of unique keys.
+    """
     unique_keys = set()
     for doc in stream_json_file(file_path):
         stack = [doc]
@@ -216,41 +266,58 @@ def collect_keys_from_file(file_path):
                 stack.extend(current)
     return unique_keys
 
-# ----------------------------
-# File processing
-# ----------------------------
-def process_one_file(file_path, output_dir, groundtruth_file, synonym_map):
-    output_path = output_dir / file_path.name
-    seen_mappings = set()
-    all_mappings = []
-
-    with open(output_path, "w", encoding="utf-8") as f_out, \
-         open(groundtruth_file, "a", encoding="utf-8") as f_gt:
-
-        for doc in tqdm(stream_json_file(file_path), desc=f"Processing {file_path.name}"):
-            transformed_doc = transform_document(doc, synonym_map)
-            mapping = build_mapping(doc, transformed_doc, file_path.stem)
-
-            for m in mapping:
-                m_key = tuple(sorted(m.items()))
-                if m_key not in seen_mappings:
-                    seen_mappings.add(m_key)
-                    all_mappings.append(m)
-
-            f_out.write(json.dumps(transformed_doc) + "\n")
-
-        for map_entry in all_mappings:
-            f_gt.write(json.dumps(map_entry) + "\n")
 
 # ----------------------------
 # Dataset processing
 # ----------------------------
+def balanced_assign_modes(files):
+    """
+    Deterministically assign modes ("linguistic" / "structural") 
+    to files with a ~50/50 split.
+
+    Args:
+        files (list): List of file paths.
+    Returns:
+        dict: Mapping from file path to assigned mode.
+    """
+    # Sort by hash so order is stable across runs
+    sorted_files = sorted(files, key=lambda f: int(hashlib.md5(f.name.encode("utf-8")).hexdigest(), 16))
+
+    half = len(sorted_files) // 2
+    assignments = {}
+    for i, f in enumerate(sorted_files):
+        mode = "linguistic" if i < half else "structural"
+        assignments[f] = mode
+    return assignments
+
+def process_one_file(file_path, output_dir, groundtruth_file, synonym_map, mode):
+    """
+    Process a single JSON file and apply transformations.
+
+    Args:
+        file_path (str or Path): Path to the input JSON file.
+        output_dir (str or Path): Directory to save transformed JSON.
+        groundtruth_file (str or Path): File to append groundtruth mappings.
+        synonym_map (dict): Mapping from original keys to synonyms.
+        mode (str): Transformation type ("linguistic" or "structural").
+    """
+    output_path = output_dir / file_path.name
+    all_final_map = {}
+
+    with open(output_path, "w", encoding="utf-8") as f_out:
+        for doc in tqdm(stream_json_file(file_path), desc=f"Processing {file_path.name}"):
+            transformed_doc, final_map, _, _ = transform_document(doc, synonym_map, mode=mode)
+            f_out.write(json.dumps(transformed_doc) + "\n")
+            all_final_map.update(final_map)
+
+    save_final_map(all_final_map, filename=file_path.name, output_path=groundtruth_file, mode=mode)
+
 def process_datasets(input_root, output_root, groundtruth_file, sample_size=1, seed=42, batch_size=8):
     input_root, output_root, groundtruth_file = Path(input_root), Path(output_root), Path(groundtruth_file)
     output_root.mkdir(parents=True, exist_ok=True)
     groundtruth_file.parent.mkdir(parents=True, exist_ok=True)
 
-    all_files = list(Path(input_root).glob("*.json"))
+    all_files = list(input_root.glob("*.json"))
     if not all_files:
         print("No input files found.")
         return
@@ -259,17 +326,21 @@ def process_datasets(input_root, output_root, groundtruth_file, sample_size=1, s
     selected_files = random.sample(all_files, min(sample_size, len(all_files)))
     print(f"Processing {len(selected_files)} files...", flush=True)
 
-    # Step 1: Collect all unique keys from selected files
+    # Step 1: Collect all unique keys
     all_keys = set()
     for file_path in tqdm(selected_files, desc="Collecting unique keys"):
         all_keys.update(collect_keys_from_file(file_path))
 
-    # Step 2: Build synonym map safely on GPU
+    # Step 2: Build synonym map
     synonym_map = build_synonym_mapping(all_keys, batch_size=batch_size)
 
-    # Step 3: Process each file line by line
-    for file_path in tqdm(selected_files, desc="Transforming files"):
-        process_one_file(file_path, output_root, groundtruth_file, synonym_map)
+    # Step 3: Assign balanced modes
+    assignments = balanced_assign_modes(selected_files)
+
+    # Step 4: Process each file with its assigned mode
+    for file_path, mode in tqdm(assignments.items(), desc="Transforming files"):
+        process_one_file(file_path, output_root, groundtruth_file, synonym_map, mode=mode)
+
 
 # ----------------------------
 # CLI
@@ -280,7 +351,7 @@ def parse_args():
     parser.add_argument("output_dir")
     parser.add_argument("groundtruth_file", help="File to store groundtruth mappings")
     parser.add_argument("--sample_size", type=int, default=10, help="Number of files to process")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--seed", type=int, default=101, help="Random seed")
     parser.add_argument("--batch_size", type=int, default=64, help="GPU batch size for synonym generation")
     return parser.parse_args()
 
