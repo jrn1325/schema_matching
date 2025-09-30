@@ -6,8 +6,9 @@ import os
 import random
 import time
 import wordninja
-from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from copy import deepcopy
+from pathlib import Path
 from tqdm import tqdm
 
 # ----------------------------
@@ -433,8 +434,6 @@ def apply_transformations(docs, assignments, synonym_map, filename):
     return transformed_docs, list(ground_truth_dict.values())
 
 
-
-
 # ----------------------------
 # Step 8: Load/save JSON
 # ----------------------------
@@ -502,12 +501,12 @@ def process_one_file(file_path, output_dir, ling_ratio, struct1_ratio, struct2_r
     output_file = output_dir / file_path.name
     if output_file.exists():
         print(f"Skipping {file_path.name} (already exists).")
-        return [], []
+        return []
 
     docs = list(load_json_lines(file_path))
     if not docs:
         print(f"No documents in {file_path.name}, skipping.")
-        return [], []
+        return []
 
     # 1. Collect paths and keys
     paths = collect_all_paths(docs)
@@ -530,7 +529,9 @@ def process_one_file(file_path, output_dir, ling_ratio, struct1_ratio, struct2_r
 # ----------------------------
 # Step 10: Process all datasets
 # ----------------------------
-def process_datasets(input_dir, output_dir, groundtruth_file, sample_size=2, ling_ratio=0.5, struct1_ratio=0.25, struct2_ratio=0.25, batch_size=8, seed=42):
+def process_datasets(input_dir, output_dir, groundtruth_file, sample_size=2,
+                     ling_ratio=0.5, struct1_ratio=0.25, struct2_ratio=0.25,
+                     batch_size=8, seed=42, n_jobs=None):
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -543,27 +544,44 @@ def process_datasets(input_dir, output_dir, groundtruth_file, sample_size=2, lin
         print("No JSON files found in input directory.")
         return
 
-    # Sample files to process
+    # Filter out files that already have been transformed 
+    unprocessed_files = [
+        f for f in all_files if not (output_dir / f.name).exists()
+    ]
+
+    if not unprocessed_files:
+        print("All files have already been transformed.")
+        return
+
+    # Sample files to process only from the unprocessed set
     random.seed(seed)
-    selected_files = random.sample(all_files, min(sample_size, len(all_files)))
+    selected_files = random.sample(unprocessed_files, min(sample_size, len(unprocessed_files)))
     print(f"Selected {len(selected_files)} files for processing.")
 
     all_ground_truth = []
 
-    for file_path in tqdm(selected_files, desc="Processing files"):
-        file_ground_truth = process_one_file(
-            file_path, output_dir,
-            ling_ratio, struct1_ratio, struct2_ratio,
-            batch_size, seed
-        )
+    # Run in parallel
+    with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+        futures = {
+            executor.submit(
+                process_one_file, file_path, output_dir,
+                ling_ratio, struct1_ratio, struct2_ratio,
+                batch_size, seed
+            ): file_path
+            for file_path in selected_files
+        }
 
-        # Collect ground truth for this file
-        all_ground_truth.extend(file_ground_truth)
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
+            file_path = futures[future]
+            try:
+                file_ground_truth = future.result()
+                all_ground_truth.extend(file_ground_truth)
+            except Exception as e:
+                print(f"Error processing {file_path.name}: {e}")
 
     # Save single consolidated ground truth file
     save_ground_truth(all_ground_truth, groundtruth_file)
     print(f"Processed {len(selected_files)} files and saved ground truth.")
-
 # ----------------------------
 # Step 11: CLI
 # ----------------------------
@@ -572,7 +590,7 @@ def parse_args():
     parser.add_argument("input_dir")
     parser.add_argument("output_dir")
     parser.add_argument("groundtruth_file")
-    parser.add_argument("--sample_size", type=int, default=2)
+    parser.add_argument("--sample_size", type=int, default=25)
     parser.add_argument("--seed", type=int, default=101)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--ling_ratio", type=float, default=0.5)
