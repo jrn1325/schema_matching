@@ -47,28 +47,31 @@ def collect_all_paths(docs):
 
     Args:
         docs (list): List of JSON documents.
-    Returns:    
-        dict: Mapping of path identifiers to paths.
+
+    Returns:
+        list: List of unique paths.
     """
     all_paths = set()
     for doc in docs:
         all_paths.update(extract_paths(doc))
-    return {f"path_{i}": p for i, p in enumerate(sorted(all_paths), 1)}
+    return sorted(all_paths)
 
-def extract_unique_keys_from_paths(paths):
+def extract_leaf_key(paths):
     """
-    Extract unique keys from a dictionary of paths.
-    
+    Extract unique leaf keys from a list of paths.
+
     Args:
-        paths (dict): Mapping of path identifiers to paths.
+        paths (list): List of paths as strings.
     Returns:
-        set: Set of unique keys.
-    """ 
+        set: Set of unique leaf keys (last segment of each path).
+    """
     unique_keys = set()
-    for path in paths.values():
+    for path in paths:
         parts = path.split(".")
-        unique_keys.update(parts)
+        if parts[-1] != "*":  # Ignore array placeholders
+            unique_keys.add(parts[-1])
     return unique_keys
+
 
 
 # ----------------------------
@@ -95,7 +98,7 @@ def build_synonym_mapping(unique_keys, batch_size=8, model="gemini-2.5-flash"):
         prompt = (
             "Provide a synonym for each JSON key below. "
             "Return only one word per line, no extra text, in the same order:\n" +
-            "\n".join(f"{j + 1}. Key: '{key}' → Synonym:" for j, key in enumerate(batch_keys))
+            "\n".join(f"Key: '{key}' → Synonym:" for key in batch_keys)
         )
 
         response = None
@@ -105,12 +108,13 @@ def build_synonym_mapping(unique_keys, batch_size=8, model="gemini-2.5-flash"):
                 break
             except Exception as e:
                 if "429" in str(e):
+                    #print(f"Rate limit exceeded, retrying in {2 ** attempt} seconds...", flush=True)
                     time.sleep(2 ** attempt)
                 else:
                     raise
 
         for key, line in zip(batch_keys, (response.text.split("\n") if response and hasattr(response, "text") else batch_keys)):
-            synonym = "".join(c for c in line.strip() if c.isalnum() or c == "_") or key
+            synonym = line.strip() or key
             synonym_map[key] = synonym
 
     return synonym_map
@@ -119,44 +123,36 @@ def build_synonym_mapping(unique_keys, batch_size=8, model="gemini-2.5-flash"):
 # ----------------------------
 # Step 3: Linguistic transformations
 # ----------------------------
-def replace_keys(doc, synonym_map, parent_key_map=None):
+def replace_last_key(doc, path, synonym_map):
     """
-    Replace keys in a JSON document based on a synonym mapping.
+    Replace only the last key in a given path in the JSON document.
 
     Args:
         doc (dict or list): The JSON document.
+        path (str): Dot-separated path string ('Logging.Sinks.*.Level').
         synonym_map (dict): Mapping of original keys to synonyms.
-        parent_key_map (dict, optional): Mapping of parent keys to their synonyms. Defaults to None.
     """
-    if parent_key_map is None:
-        parent_key_map = {}
+    parts = path.split(".")
+    if not parts:
+        return
 
-    if isinstance(doc, dict):
-        keys_to_process = list(doc.keys())
-        for k in keys_to_process:
-            v = doc[k]
-
-            # Determine the new key, propagating parent mapping if needed
-            mapped_key = synonym_map.get(k, k)
-            if k in parent_key_map:
-                mapped_key = parent_key_map[k]
-
-            # Update dict if key changed
-            if mapped_key != k:
-                doc[mapped_key] = doc.pop(k)
-
-            # Update parent_key_map for children
-            child_parent_map = parent_key_map.copy()
-            child_parent_map[k] = mapped_key
-
-            # Recurse if value is dict or list
-            if isinstance(v, (dict, list)):
-                replace_keys(doc[mapped_key], synonym_map, child_parent_map)
-
-    elif isinstance(doc, list):
-        for item in doc:
-            if isinstance(item, (dict, list)):
-                replace_keys(item, synonym_map, parent_key_map)
+    cur = doc
+    for i, part in enumerate(parts):
+        if part == "*":
+            if isinstance(cur, list):
+                for item in cur:
+                    replace_last_key(item, ".".join(parts[i+1:]), synonym_map)
+            return
+        if i == len(parts) - 1:
+            if isinstance(cur, dict) and part in cur:
+                new_key = synonym_map.get(part, part)
+                if new_key != part:
+                    cur[new_key] = cur.pop(part)
+        else:
+            if isinstance(cur, dict) and part in cur:
+                cur = cur[part]
+            else:
+                return
 
 
 # ----------------------------
@@ -252,9 +248,19 @@ def decrease_nesting(doc, parent_key=""):
         for k, v in doc.items():
             new_key = f"{parent_key}{k[0].upper()}{k[1:]}" if parent_key else k
             if isinstance(v, dict):
-                result.update(decrease_nesting(v, new_key))
+                nested = decrease_nesting(v, new_key)
+                for nk, nv in nested.items():
+                    if nk not in result: # Check for key collision
+                        result[nk] = nv
+                    else:
+                        print(f"Key collision detected: {nk}, keeping nested dict under {k}", flush=True)
+                        result[k] = v
             else:
-                result[new_key] = v
+                if new_key not in result: # Check for key collision
+                    result[new_key] = v
+                else:
+                    print(f"Key collision detected: {new_key}, keeping original key {k}", flush=True)
+                    result[k] = v
     elif isinstance(doc, list):
         result = [decrease_nesting(item, parent_key) if isinstance(item, dict) else item for item in doc]
     else:
@@ -265,24 +271,6 @@ def decrease_nesting(doc, parent_key=""):
 # ----------------------------
 # Step 6: Assign transformations
 # ----------------------------
-def build_parent_child_map(paths):
-    """
-    Build a mapping of parent path -> set of child paths.
-
-    Args:
-        paths (dict): {name: path_string}
-    Returns:
-        dict: parent_path -> set of child paths
-    """
-    parent_map = {}
-    for p in paths.values():
-        parts = p.split(".")
-        for i in range(1, len(parts)):
-            parent = ".".join(parts[:i])
-            child = ".".join(parts[:i+1])
-            parent_map.setdefault(parent, set()).add(child)
-    return parent_map
-
 def get_transformed_path(original_path, synonym_map):
     """
     Return transformed path using synonym_map for all keys.
@@ -297,58 +285,49 @@ def get_transformed_path(original_path, synonym_map):
     transformed_parts = [p if p == "*" else synonym_map.get(p, p) for p in parts]
     return ".".join(transformed_parts)
 
-def assign_transformations(paths, synonym_map, ratio_l=0.5, ratio_s1=0.25, ratio_s2=0.25, seed=None):
+def assign_transformations(paths, ratio_l=0.5, ratio_s1=0.25, ratio_s2=0.25, seed=None):
     """
-    Assign transformations to paths and propagate to descendants.
+    Assign transformations to paths (list version).
 
     Args:
-        paths (dict): {name: path_string}
-        synonym_map (dict): {key: synonym}
-        ratio_l, ratio_s1, ratio_s2 (float): Ratios
-        seed (int, optional): Random seed
+        paths (list): List of unique paths.
+        ratio_l (float): Ratio for linguistic changes.
+        ratio_s1 (float): Ratio for structural increase nesting.
+        ratio_s2 (float): Ratio for structural decrease nesting.
+        seed (int): Random seed.
+
     Returns:
-        dict: {path_id: {"path": str, "linguistic": bool, "structural": str|None}}
+        list: Each entry is a dict {"path": str, "linguistic": bool, "structural": str|Null}
     """
     if seed is not None:
         random.seed(seed)
 
     n = len(paths)
-    all_keys = list(paths.keys())
-    random.shuffle(all_keys)
+    shuffled = paths.copy()
+    random.shuffle(shuffled)
 
     s1_count = int(n * ratio_s1)
     s2_count = int(n * ratio_s2)
     l_count = int(n * ratio_l)
 
-    s1_keys = set(all_keys[:s1_count])
-    s2_keys = set(all_keys[s1_count:s1_count+s2_count])
-    l_keys = set(random.sample(all_keys, l_count))
+    s1_paths = set(shuffled[:s1_count])
+    s2_paths = set(shuffled[s1_count:s1_count+s2_count])
+    l_paths = set(random.sample(shuffled, l_count))
 
-    # Build parent-child map
-    parent_map = build_parent_child_map(paths)
-
-    # Propagate linguistic changes
-    all_linguistic_paths = set()
-    for p in l_keys:
-        # Add p and all descendants
-        stack = [paths[p]]
-        while stack:
-            cur = stack.pop()
-            all_linguistic_paths.add(cur)
-            for child in parent_map.get(cur, []):
-                if child not in all_linguistic_paths:
-                    stack.append(child)
-
-    assignments = {}
-    for name, path in paths.items():
-        assignments[name] = {
+    assignments = []
+    for path in paths:
+        assignments.append({
             "path": path,
-            "linguistic": path in all_linguistic_paths and any(synonym_map.get(k, k) != k for k in path.split(".") if k != "*"),
+            "linguistic": path in l_paths,
             "structural": (
-                "increase_nesting" if name in s1_keys else
-                "reduce_nesting" if name in s2_keys else None
+                "increase_nesting" if path in s1_paths else
+                "reduce_nesting" if path in s2_paths else None
             )
-        }
+        })
+    
+    # Sort paths by depth (top-level first)
+    assignments = sorted(assignments, key=lambda r: len(r["path"].split(".")))
+
     return assignments
 
 
@@ -357,81 +336,82 @@ def assign_transformations(paths, synonym_map, ratio_l=0.5, ratio_s1=0.25, ratio
 # ----------------------------
 def apply_transformations(docs, assignments, synonym_map, filename):
     """
-    Apply assigned transformations to a list of JSON documents and produce ground truth.
+    Apply transformations and produce ground truth, propagating parent changes to children.
 
     Args:
         docs (list): List of JSON documents.
-        assignments (dict): {path_id: {"path": str, "linguistic": bool, "structural": str|None}}
-        synonym_map (dict): {key: synonym}
-        filename (str): Name of the file being processed.
+        assignments (list): List of transformations per path, sorted by shortest path first.
+        synonym_map (dict): Key -> synonym mapping.
+        filename (str): File name.
+
     Returns:
-        tuple: (transformed_docs, list of ground truth entries)
+        tuple: (transformed_docs, ground_truth_list)
     """
     transformed_docs = []
-    ground_truth_dict = {}  # Track unique paths per file
+    ground_truth_set = set()
+    ground_truth = []
+    path_transform_map = {}
 
     for doc in docs:
         new_doc = deepcopy(doc)
-        for rule in assignments.values():
+        for rule in assignments:
             path = rule["path"]
-            structural = rule["structural"]
+            parts = path.split(".")
 
-            # Apply linguistic key renaming if assigned
-            if rule["linguistic"]:
-                replace_keys(new_doc, synonym_map)
+            # Build transformed path from parent transformations
+            transformed_parts = []
+            for i, p in enumerate(parts):
+                parent_path = ".".join(parts[:i])
+                if parent_path in path_transform_map:
+                    transformed_parts = path_transform_map[parent_path].split(".")
+                # Apply linguistic change only to last key
+                if i == len(parts) - 1 and rule["linguistic"]:
+                    transformed_parts.append(synonym_map.get(p, p))
+                else:
+                    transformed_parts.append(p)
 
             # Apply structural transformations
-            if structural == "increase_nesting":
-                set_by_path(new_doc, path, increase_nesting)
-            elif structural == "reduce_nesting":
-                if "." in path:
-                    set_by_path(new_doc, path, decrease_nesting)
-                else:
-                    # Skip top-level reduce_nesting
-                    structural = "Can't reduce top-level"
-
-            # Compute transformed path
-            parts = path.split(".")
-            transformed_parts = [
-                synonym_map.get(p, p) if p != "*" else p
-                for p in parts
-            ]
-
             if rule["structural"] == "increase_nesting":
-                # Apply WordNinja to the last key to reflect increased nesting
-                last_key = transformed_parts[-1]
-                words = wordninja.split(synonym_map.get(last_key, last_key))
-                if len(words) > 1:
-                    set_by_path(new_doc, path, increase_nesting)
-                    transformed_path = ".".join(words)
+                set_by_path(new_doc, path, increase_nesting)
+                # Split last key if possible
+                last_key_words = wordninja.split(transformed_parts[-1])
+                if len(last_key_words) > 1:
+                    transformed_parts[-1:] = last_key_words
                 else:
-                    # Nesting not possible
-                    structural = "Can't increase"
-                    transformed_path = get_transformed_path(path, synonym_map)
+                    rule["structural"] = "Can't increase"
 
             elif rule["structural"] == "reduce_nesting" and "." in path:
-                # Flatten nested keys
+                set_by_path(new_doc, path, decrease_nesting)
+                # Flatten all parts into one key
                 flattened_key = "".join(
                     part[0].upper() + part[1:] if i > 0 else part
                     for i, part in enumerate(transformed_parts)
                 )
                 transformed_parts = [flattened_key]
 
+            # Propagate to children
             transformed_path = ".".join(transformed_parts)
+            path_transform_map[path] = transformed_path  
 
-            # Record ground truth once per original path
-            if path not in ground_truth_dict:
-                ground_truth_dict[path] = {
+            # Record ground truth
+            gt_key = (filename, path)
+            if gt_key not in ground_truth_set:
+                ground_truth_set.add(gt_key)
+                original_key = path.split(".")[-1]
+                transformed_key = transformed_path.split(".")[-1]
+                ground_truth.append({
                     "filename": filename,
                     "original_path": path,
                     "transformed_path": transformed_path,
-                    "linguistic": transformed_path != path, #rule["linguistic"],
-                    "structural": structural
-                }
+                    "linguistic": original_key != transformed_key,
+                    "structural": rule["structural"]
+                })
 
         transformed_docs.append(new_doc)
 
-    return transformed_docs, list(ground_truth_dict.values())
+    return transformed_docs, ground_truth
+
+
 
 
 # ----------------------------
@@ -475,7 +455,7 @@ def save_ground_truth(ground_truth, output_file):
     output_file = Path(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     
-    with open(output_file, "w") as f:
+    with open(output_file, "a") as f:
         for entry in ground_truth:
             f.write(json.dumps(entry) + "\n")
 
@@ -510,13 +490,13 @@ def process_one_file(file_path, output_dir, ling_ratio, struct1_ratio, struct2_r
 
     # 1. Collect paths and keys
     paths = collect_all_paths(docs)
-    unique_keys = extract_unique_keys_from_paths(paths)
+    unique_keys = extract_leaf_key(paths)
 
     # 2. Build synonym map
     synonym_map = build_synonym_mapping(unique_keys, batch_size=batch_size)
 
     # 3. Assign transformations
-    assignments = assign_transformations(paths, synonym_map, ratio_l=ling_ratio, ratio_s1=struct1_ratio, ratio_s2=struct2_ratio, seed=seed)
+    assignments = assign_transformations(paths, ratio_l=ling_ratio, ratio_s1=struct1_ratio, ratio_s2=struct2_ratio, seed=seed)
 
     # 4. Apply transformations
     transformed_docs, ground_truth = apply_transformations(docs, assignments, synonym_map, file_path.name)
@@ -590,7 +570,7 @@ def parse_args():
     parser.add_argument("input_dir")
     parser.add_argument("output_dir")
     parser.add_argument("groundtruth_file")
-    parser.add_argument("--sample_size", type=int, default=25)
+    parser.add_argument("--sample_size", type=int, default=50)
     parser.add_argument("--seed", type=int, default=101)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--ling_ratio", type=float, default=0.5)
