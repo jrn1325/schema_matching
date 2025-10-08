@@ -20,10 +20,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
 # ----------------------------
-# JSON path utilities
+# JSON path extraction and stats
 # ----------------------------
 def parse_document(doc, path=''):
-    """Recursively parse JSON document and yield (path, value, siblings)
+    """
+    Parse JSON document and yield (path, value, siblings)
 
     Args:
         doc: JSON document (dict, list, or primitive)
@@ -57,7 +58,9 @@ def normalize_value(value):
     return json.dumps(value, sort_keys=True)
 
 def infer_type(value):
-    """Infer JSON type
+    """
+    Infer JSON type
+    
     Args:
         value: JSON value
     Returns:
@@ -141,6 +144,7 @@ def extract_paths(docs):
         "key_entropy_count": 0,
         "num_children_sum": 0,
         "num_children_count": 0,
+        "path_emb": None,
         "values": set(),
     })
 
@@ -189,6 +193,7 @@ def extract_paths(docs):
             "nesting_depth": entry["nesting_depth"],
             "freq": entry["freq"], 
             "norm_freq": entry["doc_count"] / num_docs if num_docs else 0,
+            "path_emb": calc_embeddings([path], model, tokenizer).tolist(),
             "values_emb": calc_embeddings(list(entry["values"]), model, tokenizer).tolist() if entry["values"] else 0,
         }
     return final
@@ -211,7 +216,7 @@ def process_file(file_path):
         with open(file_path, encoding="utf-8") as f:
             docs = [json.loads(line) for line in f if line.strip()]
     except json.JSONDecodeError:
-        print(f"[Error] Invalid JSON in {file_path}", flush=True)
+        print(f"Error: Invalid JSON in {file_path}", flush=True)
         return None
 
     stats = extract_paths(docs)
@@ -241,7 +246,7 @@ def process_files(source_dir, target_dir, source_output_csv, target_output_csv):
     source_files = [f for f in source_files if f.name in target_filenames]
 
     if len(source_files) != len(target_files):
-        print("[Warning] Number of matched source and target files does not match.")
+        print("Warning: Number of matched source and target files does not match.")
 
     for split_name, files, output_csv in [
         ("source", source_files, source_output_csv),
@@ -269,6 +274,7 @@ def process_files(source_dir, target_dir, source_output_csv, target_output_csv):
                     "nesting_depth": stats.get("nesting_depth", 0),
                     "freq": stats.get("freq", 0),
                     "norm_freq": stats.get("norm_freq", 0),
+                    "path_emb": stats.get("path_emb", ""),
                     "values_emb": stats.get("values_emb", ""),
                 })
 
@@ -277,7 +283,7 @@ def process_files(source_dir, target_dir, source_output_csv, target_output_csv):
             writer = csv.DictWriter(fout, fieldnames=[
                 "filename", "path", "types", "child_keys",
                 "num_siblings", "key_entropy", "num_children", "nesting_depth",
-                "freq", "norm_freq", "values_emb"
+                "freq", "norm_freq", "path_emb", "values_emb"
             ], delimiter=";")
             writer.writeheader()
             writer.writerows(all_rows)
