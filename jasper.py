@@ -1,14 +1,11 @@
 import argparse
-import collections
-import csm
-import csv
+import ast
 import json
-import math
 import pandas as pd
 import random
-import re
 import sys
 import time
+import torch
 import torch.nn.functional as F
 
 
@@ -20,226 +17,34 @@ from valentine.algorithms import Coma, Cupid, DistributionBased, JaccardDistance
 
 
 
-def score_path(entry, w_depth=0.4, w_entropy=0.3, w_siblings=0.3):
+# ----------------------------
+# Type compatibility functions for Jasper
+# ----------------------------
+def are_types_compatible(type1, type2):
     """
-    Compute a hybrid score for a path entry using weighted sum of:
-    - nesting depth
-    - key entropy (diversity of subkeys)
-    - number of siblings (cardinality)
+    Check if two JSON types are semantically compatible.
 
     Args:
-        entry (dict): Stats for a single path.
-        w_depth (float): Weight for nesting depth.
-        w_entropy (float): Weight for key entropy.
-        w_siblings (float): Weight for number of siblings.
-    
-    Returns:
-        float: Composite score.
-    """
-    return (
-        w_depth * entry["nesting_depth"] +
-        w_entropy * entry["key_entropy"] +
-        w_siblings * entry["num_siblings"]
-    )
-
-def sample_paths(path_stats, k):
-    """
-    Sample k paths using score-weighted random sampling.
-
-    Args:
-        path_stats (dict): Output of extract_paths.
-        k (int): Number of paths to sample.
-
-    Returns:
-        dict: Subset of path_stats with k sampled paths.
-    """
-    # Compute scores for each path
-    scored_items = [(path, stats, score_path(stats)) for path, stats in path_stats.items()]
-
-    # Avoid division by zero if all scores are zero
-    total_score = sum(score for _, _, score in scored_items)
-    if total_score == 0:
-        # Fall back to uniform sampling
-        weights = [1] * len(scored_items)
-    else:
-        weights = [score / total_score for _, _, score in scored_items]
-
-    # Sample k unique items without replacement
-    sampled = random.choices(
-        population=scored_items,
-        weights=weights,
-        k=min(k, len(scored_items))
-    )
-
-    # Convert to dict format
-    return {path: stats for path, stats, _ in sampled}
-
-
-
-# Linguistic similarity functions for Jasper
-def get_linguistic_similarity(emb1, emb2):
-    """
-    Compute cosine similarity between two precomputed embeddings.
-    
-    Args:
-        emb1 (torch.Tensor): Embedding for path 1.
-        emb2 (torch.Tensor): Embedding for path 2.
-    Returns:
-        float: Cosine similarity score between -1 and 1.
-    """
-    return F.cosine_similarity(emb1.unsqueeze(0), emb2.unsqueeze(0), dim=1).item()
-
-
-# Structural similarity functions for Jasper
-def weighted_depth_similarity(keys1, keys2):
-    """
-    Compute depth similarity with a bigger penalty for larger differences.
-
-    Args:
-        keys1 (list): Path 1 keys.
-        keys2 (list): Path 2 keys.
-
-    Returns:
-        float: Depth similarity score (0 to 1).
-    """
-    len1, len2 = len(keys1), len(keys2)
-    if len1 == 0 and len2 == 0:
-        return 1.0
-    depth_diff = abs(len1 - len2)
-    max_depth = max(len1, len2)
-    return 1 - (depth_diff / max_depth) ** 2
-
-def divergence_penalty(keys1, keys2):
-    """
-    Penalize paths that diverge earlier in the hierarchy, with greater penalties for divergence
-    that happens at higher levels of the path.
-
-    Args:
-        keys1 (list): Path 1 keys.
-        keys2 (list): Path 2 keys.
-
-    Returns:
-        float: Penalty factor (0 to 1). Lower value for early divergence.
-    """
-    for i, (a, b) in enumerate(zip(keys1, keys2)):
-        if a != b:
-            return 1 / (1 + i)
-    return 1.0
-
-def sibling_similarity(num_siblings1, num_siblings2):
-    """
-    Compare the number of sibling keys at the same level in two paths.
-
-    Args:
-        num_siblings1 (int): The number of sibling keys at the same level for path1.
-        num_siblings2 (int): The number of sibling keys at the same level for path2.
-
-    Returns:
-        float: Similarity score (0 to 1).
-    """
-    diff = abs(num_siblings1 - num_siblings2)
-    return 1 / (1 + diff)
-
-def type_similarity(type1, type2):
-    """
-    Compare the dominant data types under each path.
-
-    Args:
-        type1 (str): The data type of the value at path1.
-        type2 (str): The data type of the value at path2.
-
-    Returns:
-        float: 1.0 if same type, else 0.0.
-    """
-    return 1.0 if type1 == type2 else 0.0
-
-def key_entropy_similarity(entropy1, entropy2):
-    """
-    Compare the key entropy of two paths to measure the variability in their nested structures.
-    A lower difference in entropy indicates more similarity in the structure.
-
-    Args:
-        entropy1 (float): The key entropy value at path1, representing the variability of keys.
-        entropy2 (float): The key entropy value at path2, representing the variability of keys.
-
-    Returns:
-        float: Similarity score between 0 and 1.
-    """
-    diff = abs(entropy1 - entropy2)
-    return 1 / (1 + diff)
-
-def get_structural_similarity(
-    path1, path2, path1_stats, path2_stats,
-    w_depth=0.167, w_prefix=0.167, w_divergence=0.167,
-    w_sibling=0.167, w_type=0.167, w_entropy=0.167
-):
-    """
-    Compute structural similarity between two paths based on their statistics.
-    
-    Args:
-        path1 (str): Path 1 in dot notation.
-        path2 (str): Path 2 in dot notation.
-        path1_stats (dict): Statistics for path 1.
-        path2_stats (dict): Statistics for path 2.
-    Returns:
-        float: Structural similarity score between 0 and 1.
-    """
-    keys1 = path1.split('.')
-    keys2 = path2.split('.')
-
-    depth_sim = weighted_depth_similarity(keys1, keys2)
-    prefix_len = sum(a == b for a, b in zip(keys1, keys2))
-    prefix_sim = prefix_len / max(len(keys1), len(keys2))
-    divergence = divergence_penalty(keys1, keys2)
-    sibling_sim = sibling_similarity(
-        path1_stats.get("num_siblings", 0),
-        path2_stats.get("num_siblings", 0)
-    )
-    type_sim = type_similarity(
-        path1_stats.get("type"),
-        path2_stats.get("type")
-    )
-    entropy_sim = key_entropy_similarity(
-        path1_stats.get("key_entropy", 0.0),
-        path2_stats.get("key_entropy", 0.0)
-    )
-
-    return (
-        w_depth * depth_sim +
-        w_prefix * prefix_sim +
-        w_divergence * divergence +
-        w_sibling * sibling_sim +
-        w_type * type_sim +
-        w_entropy * entropy_sim
-    )
-
-
-# Matching functions for Jasper
-def are_types_compatible(type1, type2, stats1=None, stats2=None, strict=True):
-    """
-    Check if two JSON types are compatible.
-
-    Args:
-        type1 (str): First type (e.g., 'object', 'string', 'number').
+        type1 (str): First type (e.g., 'object', 'string', 'number', 'array', 'boolean', 'null').
         type2 (str): Second type.
-        stats1 (dict, optional): Stats for path1.
-        stats2 (dict, optional): Stats for path2.
-        strict (bool): Whether to enforce exact matching of types.
 
     Returns:
         bool: True if compatible, False otherwise.
     """
+
+    # Exact match
     if type1 == type2:
         return True
 
-    # Allow null matching anything
+    # Allow null to match anything
     if type1 == "null" or type2 == "null":
         return True
 
-    if strict:
-        return False
+    # Allow integer ≈ number
+    if (type1 == "integer" and type2 == "number") or (type1 == "number" and type2 == "integer"):
+        return True
 
-    # Incompatible scalar combinations
+    # Prevent incompatible scalar types
     scalar_incompatibles = {
         ("string", "number"), ("number", "string"),
         ("string", "boolean"), ("boolean", "string"),
@@ -248,17 +53,138 @@ def are_types_compatible(type1, type2, stats1=None, stats2=None, strict=True):
     if (type1, type2) in scalar_incompatibles or (type2, type1) in scalar_incompatibles:
         return False
 
-    # Allow integer ≈ number
-    if (type1 == "integer" and type2 == "number") or (type2 == "integer" and type1 == "number"):
-        return True
-
-    # Object vs array of objects (relaxed)
-    if type1 == "object" and type2 == "array":
-        return is_array_of_objects(stats2)
-    if type2 == "object" and type1 == "array":
-        return is_array_of_objects(stats1)
+    # Prevent incompatible structural types
+    structural_incompatibles = {
+        ("array", "string"),  ("string", "array"),
+        ("array", "number"),  ("number", "array"),
+        ("array", "boolean"), ("boolean", "array")
+    }
+    if (type1, type2) in structural_incompatibles or (type2, type1) in structural_incompatibles:
+        return False
 
     return False
+
+
+# --------------------------------------------
+# Linguistic similarity functions for Jasper
+# --------------------------------------------
+def combined_embedding(path_emb, value_emb, alpha=0.6):
+    """
+    Combine path and value embeddings using a weighted sum.
+
+    Args:
+        path_emb (torch.Tensor): Embedding for the JSON path.
+        value_emb (torch.Tensor): Embedding for the value at the path.
+        alpha (float): Weight for path embedding.
+
+    Returns:
+        torch.Tensor: Combined embedding.
+    """
+    if path_emb is None and value_emb is None:
+        return None
+    elif path_emb is None:
+        return value_emb
+    elif value_emb is None:
+        return path_emb
+    return (alpha * path_emb + (1-alpha) * value_emb) / \
+           (alpha * path_emb + (1-alpha) * value_emb).norm()
+
+def get_linguistic_similarity(source_combined_emb, target_combined_emb):
+    """
+    Compute cosine similarity between two precomputed embeddings.
+
+    Args:
+        source_combined_emb (torch.Tensor): Embedding for source path.
+        target_combined_emb (torch.Tensor): Embedding for target path.
+
+    Returns:
+        float: Cosine similarity score between -1 and 1.
+    """
+    if source_combined_emb is None or target_combined_emb is None:
+        return 0.0
+    if not isinstance(source_combined_emb, torch.Tensor):
+        source_combined_emb = torch.tensor(source_combined_emb, dtype=torch.float32)
+    if not isinstance(target_combined_emb, torch.Tensor):
+        target_combined_emb = torch.tensor(target_combined_emb, dtype=torch.float32)
+
+    return F.cosine_similarity(source_combined_emb.unsqueeze(0), target_combined_emb.unsqueeze(0), dim=1).item()
+
+
+# ----------------------------
+# Structural similarity functions for Jasper
+# ----------------------------
+def weighted_depth_similarity(source_path_keys, target_path_keys, penalty_exponent=2):
+    """
+    Compute depth similarity with a bigger penalty for larger differences.
+
+    Args:
+        source_path_keys (list): Source path keys.
+        target_path_keys (list): Target path keys.
+        penalty_exponent (int): Exponent to increase penalty for depth differences.
+
+    Returns:
+        float: Depth similarity score (0 to 1).
+    """
+    len1, len2 = len(source_path_keys), len(target_path_keys)
+    depth_diff = abs(len1 - len2)
+    max_depth = max(len1, len2)
+    return 1 - (depth_diff / max_depth) ** penalty_exponent
+
+def sibling_similarity(source_num_siblings, target_num_siblings):
+    """
+    Compare the number of sibling keys at the same level in two paths.
+
+    Args:
+        source_num_siblings (int): The number of sibling keys at the same level for the source path.
+        target_num_siblings (int): The number of sibling keys at the same level for the target path.
+
+    Returns:
+        float: Similarity score (0 to 1).
+    """
+    diff = abs(source_num_siblings - target_num_siblings)
+    return 1 / (1 + diff)
+
+def key_entropy_similarity(source_entropy, target_entropy):
+    """
+    Compare the key entropy of two paths to measure the variability in their nested structures.
+    A lower difference in entropy indicates more similarity in the structure.
+
+    Args:
+        source_entropy (float): The key entropy value at the source path, representing the variability of keys.
+        target_entropy (float): The key entropy value at the target path, representing the variability of keys.
+
+    Returns:
+        float: Similarity score between 0 and 1.
+    """
+    diff = abs(source_entropy - target_entropy)
+    return 1 / (1 + diff)
+
+def get_structural_similarity(s_row, t_row, w_depth=0.33, w_sibling=0.33, w_entropy=0.33):
+    """
+    Compute structural similarity between two paths based on their statistics.
+    
+    Args:
+        s_row (pd.Series): Statistics for source path.
+        t_row (pd.Series): Statistics for target path.
+        w_depth, w_sibling, w_entropy (float): Weights for each component.
+    Returns:
+        float: Structural similarity score between 0 and 1.
+    """
+    source_path_keys = s_row["path"].split('.')
+    target_path_keys = t_row["path"].split('.')
+    depth_sim = weighted_depth_similarity(source_path_keys, target_path_keys)
+
+    sibling_sim = sibling_similarity(
+        s_row.get("num_siblings", 0),
+        t_row.get("num_siblings", 0)
+    )
+
+    entropy_sim = key_entropy_similarity(
+        s_row.get("key_entropy", 0.0),
+        t_row.get("key_entropy", 0.0)
+    )
+
+    return (w_depth * depth_sim + w_sibling * sibling_sim + w_entropy * entropy_sim)
 
     
 # Jasper matching functions
@@ -280,47 +206,62 @@ def get_key_prefix(key):
         prefix = '$.' + prefix  # Add '$.' to indicate the start of the path
     return prefix
 
-def match_paths(paths1, paths2, ling_weight=0.5, struct_weight=0.5, min_score=0.7):
+def match_paths(source_df, target_df, ling_weight=0.5, struct_weight=0.5, min_score=0.7):
     """
     Match paths from two sets using precomputed embeddings and structural similarity.
 
     Args:
-        paths1, paths2 (dict): path -> stats
+        source_df, target_df (DataFrame): Source and target DataFrames containing path statistics.
+        ling_weight (float): Weight for linguistic similarity.
+        struct_weight (float): Weight for structural similarity.
+        min_score (float): Minimum score threshold to consider a match.
+
+    Returns:
+        dict: {source_path: [(target_path, score), ...]}
     """
-    total_weight = ling_weight + struct_weight
-    ling_weight /= total_weight
-    struct_weight /= total_weight
+    matches = defaultdict(list)
 
-    matches = {}
+    for _, s_row in source_df.iterrows():
+        for _, t_row in target_df.iterrows():
+            if not are_types_compatible(s_row["types"], t_row["types"]):
+                continue
 
-    # Precompute embeddings
-    paths1_list = list(paths1.keys())
-    paths2_list = list(paths2.keys())
-    embeddings1 = compute_embeddings_batch(paths1_list)
-    embeddings2 = compute_embeddings_batch(paths2_list)
-    
-    # Prune incompatible type pairs
-    compatible_pairs = [
-        (p1, p2)
-        for p1 in paths1_list
-        for p2 in paths2_list
-        if are_types_compatible(
-            paths1[p1].get("type"), paths2[p2].get("type"),
-            paths1[p1], paths2[p2]
-        )
-    ]
+            # Convert stringified embeddings to tensors
+            source_path_emb = torch.tensor(ast.literal_eval(s_row["path_emb"]), dtype=torch.float32)
+            source_value_emb = torch.tensor(ast.literal_eval(s_row["values_emb"]), dtype=torch.float32)
+            target_path_emb = torch.tensor(ast.literal_eval(t_row["path_emb"]), dtype=torch.float32)
+            target_value_emb = torch.tensor(ast.literal_eval(t_row["values_emb"]), dtype=torch.float32)
 
-    # Compute similarities only on valid pairs
-    for p1, p2 in compatible_pairs:
-        ling_score = get_linguistic_similarity(embeddings1[p1], embeddings2[p2])
-        struct_score = get_structural_similarity(p1, p2, paths1[p1], paths2[p2])
-        final_score = ling_weight * ling_score + struct_weight * struct_score
+            # Combine embeddings
+            source_combined_emb = combined_embedding(source_path_emb, source_value_emb)
+            target_combined_emb = combined_embedding(target_path_emb, target_value_emb)
 
-        if final_score >= min_score:
-            matches[(p1, p2)] = final_score
-            
+            # Compute similarity
+            ling_score = get_linguistic_similarity(source_combined_emb, target_combined_emb)
+            struct_score = get_structural_similarity(s_row, t_row)
+            final_score = ling_weight * ling_score + struct_weight * struct_score
+
+            if final_score >= min_score:
+                matches[s_row["path"]].append((t_row["path"], final_score))
 
     return matches
+
+
+def prune_top_k_candidates(candidate_matches, top_k=5):
+    """
+    Keep only the top-k scoring targets per source path.
+
+    Args:
+        candidate_matches (dict): {source_path: [(target_path, score), ...]}
+        top_k (int): Number of candidates to keep per source.
+
+    Returns:
+        dict: Pruned candidate matches.
+    """
+    pruned = {}
+    for s_path, targets in candidate_matches.items():
+        pruned[s_path] = sorted(targets, key=lambda x: -x[1])[:top_k]
+    return pruned
 
 def predict_matches(source_vars):
     """
@@ -330,20 +271,24 @@ def predict_matches(source_vars):
         source_vars (dict): Maps source paths to list of (var, target_path, score).
 
     Returns:
-        dict: {source_path: (target_path, score)}
+        dict: {source_path: [(target_path, score)]} — ready for evaluation
     """
-    final_matching = defaultdict(set)
+    final_matching = {}
 
     for s_path, var_list in source_vars.items():
         for var, t_path, score in var_list:
             try:
-                if hasattr(var, 'X') and round(var.X):
-                    final_matching[t_path].add((s_path, score))
+                if hasattr(var, "X") and round(var.X):
+                    final_matching[s_path] = [(t_path, score)]
                     break
             except Exception as e:
-                print(f"[Error] Reading var.X for {t_path}->{s_path}: {e}")
+                print(f"[Error] Reading var.X for {s_path}->{t_path}: {e}")
 
-    return dict(sorted(final_matching.items()))
+    # Sort by descending score
+    final_matching = dict(sorted(final_matching.items(), key=lambda x: -x[1][0][1]))
+
+    return final_matching
+
 
 def quadratic_programming(match_dict):
     """
@@ -364,33 +309,30 @@ def quadratic_programming(match_dict):
     source_vars = defaultdict(list)
     score_terms = []
 
-    grouped_by_target = defaultdict(list)
-    for (t_path, s_path), score in match_dict.items():
-        grouped_by_target[t_path].append((s_path, score))
 
-    for t_path, s_matches in grouped_by_target.items():
-        t_prefix = 't' + get_key_prefix(t_path)
-        for s_path, score in s_matches:
-            s_prefix = 's' + get_key_prefix(s_path)
+    for s_path, t_matches in match_dict.items():
+        s_prefix = 's' + get_key_prefix(s_path)
+        for t_path, score in t_matches:
+            t_prefix = 't' + get_key_prefix(t_path)
 
-            # match_var: 1 if target_path matches source_path, else 0
-            match_var = quadratic_model.addVar(vtype=GRB.BINARY, name=f"{t_path}-----{s_path}")
+            # Binary variable: 1 if source_path matches target_path
+            match_var = quadratic_model.addVar(vtype=GRB.BINARY, name=f"{s_path}-----{t_path}")
             score_terms.append(score * match_var)
             source_vars[s_path].append((match_var, t_path, score))
 
-            # prefix_var: 1 if any matching under the prefix pair exists
-            prefix_key = f'{t_prefix}-----{s_prefix}'
+            # Prefix_var: 1 if any matching under the prefix pair exists
+            prefix_key = f'{s_prefix}-----{t_prefix}'
             if prefix_key not in prefix_vars:
                 prefix_vars[prefix_key] = quadratic_model.addVar(vtype=GRB.BINARY, name=prefix_key)
             prefix_var = prefix_vars[prefix_key]
             
-            # nested_t_var: 1 if target_path matches any source_path with given prefix
+            # Nested_t_var: 1 if target_path matches any source_path with given prefix
             t_nest_key = f'{t_path}-----{s_prefix}'
             if t_nest_key not in nested_t_vars:
                 nested_t_vars[t_nest_key] = quadratic_model.addVar(vtype=GRB.BINARY, name=t_nest_key)
             nested_t_var = nested_t_vars[t_nest_key]
 
-            # nested_s_var: 1 if source_path matches any target_path with given prefix
+            # Nested_s_var: 1 if source_path matches any target_path with given prefix
             s_nest_key = f'{s_path}-----{t_prefix}'
             if s_nest_key not in nested_s_vars:           
                 nested_s_vars[s_nest_key] = quadratic_model.addVar(vtype=GRB.BINARY, name=s_nest_key)
@@ -399,21 +341,16 @@ def quadratic_programming(match_dict):
             quadratic_model.addConstr(nested_t_var <= prefix_var, name=f"c_tprefix_{t_path}_{s_path}")
             quadratic_model.addConstr(nested_s_var <= prefix_var, name=f"c_sprefix_{t_path}_{s_path}")
 
-    for s_path, match_vars in source_vars.items():
-        quadratic_model.addConstr(quicksum(var for var, _, _ in match_vars) <= 1, name=f"c_unique_{s_path}")
+    # Each source path matches at most one target path
+    for s_path, var_list in source_vars.items():
+        quadratic_model.addConstr(quicksum(var for var, _, _ in var_list) <= 1, name=f"c_unique_{s_path}")
 
     quadratic_model.update()
-
-    penalty_terms = []
-    for key, var in prefix_vars.items():
-        depth = key.count('.') + 1
-        penalty_terms.append(0.001 * depth * var)
-
-    quadratic_model.setObjective(quicksum(score_terms) - quicksum(penalty_terms), GRB.MAXIMIZE)
+    quadratic_model.setObjective(quicksum(score_terms), GRB.MAXIMIZE)
     quadratic_model.optimize()
 
     if quadratic_model.status != GRB.OPTIMAL:
-        print(f"[Warning] Model was not solved optimally. Status: {quadratic_model.status}")
+        print(f"Warning: Model was not solved optimally. Status: {quadratic_model.status}")
         if quadratic_model.status == GRB.INFEASIBLE:
             quadratic_model.computeIIS()
             quadratic_model.write("iis.ilp")
@@ -421,7 +358,6 @@ def quadratic_programming(match_dict):
         return {}
 
     return predict_matches(source_vars)
-
 
 
 # ----------------------------
@@ -482,10 +418,9 @@ def find_valentine(target_df, source_df):
 
     return results
 
-
 def reformat_valentine_matches(valentine_matches):
     """
-    Reformat Valentine matches to {target_path: [(source_path, score), ...]}.
+    Reformat Valentine matches to {source_path: [(target_path, score), ...]}.
 
     Args:
         valentine_matches (dict): Output from find_valentine.
@@ -496,8 +431,9 @@ def reformat_valentine_matches(valentine_matches):
     for (target_tuple, source_tuple), score in valentine_matches.items():
         target_path = target_tuple[1]
         source_path = source_tuple[1]
-        matches[target_path].append((source_path, score))
+        matches[source_path].append((target_path, score))
     return matches
+
 
 
 # ----------------------------
@@ -529,7 +465,6 @@ def get_ground_truth_pairs(ground_truth_path, filename):
                 gt.add((src, tgt))
     return gt
 
-
 def evaluate_matches(matches, ground_truth_pairs):
     """
     Evaluate predicted matches against ground truth from a JSON file,
@@ -542,12 +477,11 @@ def evaluate_matches(matches, ground_truth_pairs):
     Returns:
         dict: Evaluation metrics.
     """
-
     # Flatten matches to (source, target) pairs
     predicted_pairs = set()
-    for t, sources in matches.items():
-        for s, score in sources:
-            predicted_pairs.add((s, t))
+    for s_path, targets in matches.items():
+        for t_path, score in targets:
+            predicted_pairs.add((s_path, t_path))
 
     # Compute intersections and differences
     true_positives = ground_truth_pairs & predicted_pairs
@@ -580,6 +514,8 @@ def evaluate_matches(matches, ground_truth_pairs):
         "false_positives": fp,
         "false_negatives": fn,
     }
+
+
 
 # ----------------------------
 # Step 4: CLI
@@ -634,10 +570,10 @@ def main():
             for matcher_name, matches in valentine_matches.items():
                 print(f"Matcher: {matcher_name}, Matches: {len(matches)}", flush=True)
 
-                # 6. Reformat matches to {target_path: [(source_path, score), ...]}
+                # 6. Reformat matches to {source_path: [(target_path, score), ...]}
                 formatted_matches = reformat_valentine_matches(matches)
 
-                # 7. Get the top match per target path
+                # 7. Get the top match per source path
                 final_matches = {k: sorted(v, key=lambda x: -x[1])[0:1] for k, v in formatted_matches.items()}
 
                 # 8. Evaluate matches
@@ -647,12 +583,22 @@ def main():
                 print(f"Precision: {metrics['precision']:.2f}, Recall: {metrics['recall']:.2f}, F1 Score: {metrics['f1_score']:.2f}", flush=True)
 
         elif mode == "jasper":
-            matches = match_paths(sampled_target_paths, sampled_source_paths)
-            matches = quadratic_programming(matches)
-            final_matches = {k: v for k, v in sorted(matches.items(), key=lambda x: -x[1][1])[:100]}
+            candidate_matches = match_paths(source_df, target_df, ling_weight=0.5, struct_weight=0.5, min_score=0.7)
+
+            # Prune to top-k candidates
+            pruned_matches = prune_top_k_candidates(candidate_matches, top_k=5)
+
+            final_matches = quadratic_programming(pruned_matches)
+
+            # Evaluate matches
+            metrics = evaluate_matches(final_matches, pairs)
+            all_metrics.append(metrics)
+            print(f"Precision: {metrics['precision']:.2f}, Recall: {metrics['recall']:.2f}, F1 Score: {metrics['f1_score']:.2f}", flush=True)
+
+
 
         else:
-            raise ValueError("Invalid mode. Choose from: " + ", ".join(valentine_matchers + ["jasper"]))
+            raise ValueError("Invalid mode. Choose from: " + ", ".join(["valentine", "jasper"]))
 
     end_time = time.time()
     print(f"\nTotal execution time: {end_time - start_time:.2f} seconds", flush=True)
