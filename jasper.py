@@ -1,6 +1,7 @@
 import argparse
 import ast
 import json
+import math
 import pandas as pd
 import random
 import sys
@@ -188,23 +189,6 @@ def get_structural_similarity(s_row, t_row, w_depth=0.33, w_sibling=0.33, w_entr
 
     
 # Jasper matching functions
-def get_key_prefix(key):
-    """
-    Get the prefix of a key.
-
-    Args:
-        key (str): Target or source key.
-
-    Returns:
-        str: The prefix of the key.
-    """
-    # If no dot in the key, the prefix is just the '$' symbol
-    if '.' not in key:
-        prefix = '$'
-    else:
-        prefix, _ = key.rsplit('.', maxsplit=1)  # Split at the last dot
-        prefix = '$.' + prefix  # Add '$.' to indicate the start of the path
-    return prefix
 
 def match_paths(source_df, target_df, ling_weight=0.5, struct_weight=0.5, min_score=0.7):
     """
@@ -245,7 +229,6 @@ def match_paths(source_df, target_df, ling_weight=0.5, struct_weight=0.5, min_sc
                 matches[s_row["path"]].append((t_row["path"], final_score))
 
     return matches
-
 
 def prune_top_k_candidates(candidate_matches, top_k=5):
     """
@@ -289,6 +272,23 @@ def predict_matches(source_vars):
 
     return final_matching
 
+def get_key_prefix(key):
+    """
+    Get the prefix of a key.
+
+    Args:
+        key (str): Target or source key.
+
+    Returns:
+        str: The prefix of the key.
+    """
+    # If no dot in the key, the prefix is just the '$' symbol
+    if '.' not in key:
+        prefix = '$'
+    else:
+        prefix, _ = key.rsplit('.', maxsplit=1)  # Split at the last dot
+        prefix = '$.' + prefix  # Add '$.' to indicate the start of the path
+    return prefix
 
 def quadratic_programming(match_dict):
     """
@@ -391,8 +391,83 @@ def path_dict_to_df(path_dict):
     return pd.DataFrame([flat_dict])
 
 
+# -----------------------------
+# Step 2: Select datasets to evaluate
+# -----------------------------
+def filter_dataset_by_size(source_groups, target_groups, max_paths):
+    """
+    Get sources and targets with at most max_paths paths.
+
+    Args:
+        source_groups (dict): {filename: DataFrame}
+        target_groups (dict): {filename: DataFrame}
+        max_paths (int): Maximum number of paths allowed.
+    Returns:
+        list: Filenames that meet the criteria.
+    """
+    return [
+        fn for fn in source_groups.keys()
+        if len(source_groups[fn]) <= max_paths and len(target_groups[fn]) <= max_paths
+    ]
+
+def compute_max_depth(source_df, target_df):
+    """
+    Compute the maximum depth of paths in both source and target DataFrames.
+
+    Args:
+        source_df (pd.DataFrame): Source DataFrame.
+        target_df (pd.DataFrame): Target DataFrame.
+
+    Returns:
+        int: Maximum depth of paths.
+    """
+    max_source = source_df["path"].apply(lambda x: len(x.split('.'))).max()
+    max_target = target_df["path"].apply(lambda x: len(x.split('.'))).max()
+    return max(max_source, max_target)
+
+def group_datasets_by_depth(filenames, source_groups, target_groups, n_bins=3):
+    """
+    Assign each filename to a depth bin: shallow, medium, deep.
+    
+    Args:
+        filenames (list): List of filenames to stratify.
+        source_groups (dict): {filename: DataFrame}
+        target_groups (dict): {filename: DataFrame}
+        n_bins (int): Number of depth bins.
+    Returns:
+        dict: {bin_index: [filenames]}
+    """
+    dataset_depths = {fn: compute_max_depth(source_groups[fn], target_groups[fn]) for fn in filenames}
+    min_d, max_d = min(dataset_depths.values()), max(dataset_depths.values())
+    bin_size = (max_d - min_d) / n_bins
+    bins = {i: [] for i in range(n_bins)}
+    for fn, depth in dataset_depths.items():
+        bin_idx = min(int((depth - min_d) / bin_size), n_bins - 1)
+        bins[bin_idx].append(fn)
+    return bins
+
+def sample_datasets_from_bins(bins, total_sample):
+    """
+    Randomly sample total_sample filenames proportionally from bins.
+
+    Args:
+        bins (dict): {bin_index: [filenames]}
+        total_sample (int): Total number of filenames to sample.
+    Returns:
+        list: Sampled filenames.
+    """
+    n_bins = len(bins)
+    per_bin = math.ceil(total_sample / n_bins)
+    selected = []
+    for bin_files in bins.values():
+        if bin_files:
+            n_sample = min(per_bin, len(bin_files))
+            selected.extend(random.sample(bin_files, n_sample))
+    return selected
+
+
 # ----------------------------
-# Step 2: Apply matching algorithm
+# Step 3: Apply matching algorithm
 # ----------------------------
 def find_valentine(target_df, source_df):
     """
@@ -435,9 +510,8 @@ def reformat_valentine_matches(valentine_matches):
     return matches
 
 
-
 # ----------------------------
-# Step 3: Evaluate matches against ground truth
+# Step 4: Evaluate matches against ground truth
 # ----------------------------
 def get_ground_truth_pairs(ground_truth_path, filename):
     """
@@ -516,9 +590,8 @@ def evaluate_matches(matches, ground_truth_pairs):
     }
 
 
-
 # ----------------------------
-# Step 4: CLI
+# Step 5: CLI
 # ----------------------------
 def parse_args():
     parser = argparse.ArgumentParser(description="Find Matches between source and target.")
@@ -529,8 +602,8 @@ def parse_args():
     return parser.parse_args()
 
 def main():
-    #valentine_matchers = ["SimilarityFlooding", "Coma", "DistributionBased", "JaccardDistanceMatcher", "Cupid"]
-    all_metrics = []
+    all_metrics = []  # stores metrics for each matcher-dataset pair
+    output_file = "results_summary.json"
     start_time = time.time()
 
     # 1. Load datasets
@@ -538,76 +611,83 @@ def main():
     all_source_df, all_target_df = load_datasets(args.source_file, args.target_file)
     print(f"Loaded {len(all_source_df)} source rows and {len(all_target_df)} target rows.", flush=True)
 
-   # 2. Group by filename
+    # 2. Group by filename
     source_groups = {fn: df for fn, df in all_source_df.groupby("filename")}
     target_groups = {fn: df for fn, df in all_target_df.groupby("filename")}
 
-    # Loop over each unique filename
-    for fn in sorted(source_groups.keys()):
+    # 3. Select datasets for evaluation
+    eligible_files = filter_dataset_by_size(source_groups, target_groups, max_paths=200)
+    print(f"Found {len(eligible_files)} datasets with <=200 paths.", flush=True)
+
+    bins = group_datasets_by_depth(eligible_files, source_groups, target_groups, n_bins=3)
+    sample_size = max(1, int(0.1 * len(eligible_files)))
+    selected_datasets = sample_datasets_from_bins(bins, total_sample=sample_size)
+    print(f"Evaluating {len(selected_datasets)} datasets (10%).", flush=True)
+
+    # 4. Run matching and evaluation
+    for fn in sorted(selected_datasets):
         source_df = source_groups[fn]
         target_df = target_groups[fn]
-
-        # Skip datasets with more than 100 paths
-        if len(source_df) > 100 or len(target_df) > 100:
-            print(f"Skipping file {fn} (source: {len(source_df)}, target: {len(target_df)}) because it has more than 100 paths.", flush=True)
-            continue
-
-        # 3. Load ground truth pairs for this filename
         pairs = get_ground_truth_pairs(args.groundtruth_file, fn)
-        print(f"\nProcessing file: {fn} with {len(source_df)} source rows and {len(target_df)} target rows.", flush=True)
-        print(f"Ground truth has {len(pairs)} pairs.", flush=True)
+        print(f"\nProcessing {fn}: {len(source_df)} → {len(target_df)} paths, {len(pairs)} GT pairs.", flush=True)
 
         mode = args.mode
+
         if mode == "valentine":
-            # 4. Convert to DataFrame format expected by Valentine
             new_source_df = pd.DataFrame(1, index=range(len(source_df)), columns=source_df["path"].astype(str))
             new_target_df = pd.DataFrame(1, index=range(len(target_df)), columns=target_df["path"].astype(str))
 
-            # 5. Run one of Valentine matchers
-            print(f"Running Valentine matcher: {mode}", flush=True)
             valentine_matches = find_valentine(new_target_df, new_source_df)
 
             for matcher_name, matches in valentine_matches.items():
-                print(f"Matcher: {matcher_name}, Matches: {len(matches)}", flush=True)
-
-                # 6. Reformat matches to {source_path: [(target_path, score), ...]}
                 formatted_matches = reformat_valentine_matches(matches)
-
-                # 7. Get the top match per source path
                 final_matches = {k: sorted(v, key=lambda x: -x[1])[0:1] for k, v in formatted_matches.items()}
-
-                # 8. Evaluate matches
                 metrics = evaluate_matches(final_matches, pairs)
+                metrics.update({"filename": fn, "matcher": matcher_name})
                 all_metrics.append(metrics)
-
-                print(f"Precision: {metrics['precision']:.2f}, Recall: {metrics['recall']:.2f}, F1 Score: {metrics['f1_score']:.2f}", flush=True)
+                print(f"{matcher_name}: P={metrics['precision']:.2f}, R={metrics['recall']:.2f}, F1={metrics['f1_score']:.2f}", flush=True)
 
         elif mode == "jasper":
             candidate_matches = match_paths(source_df, target_df, ling_weight=0.5, struct_weight=0.5, min_score=0.7)
-
-            # Prune to top-k candidates
             pruned_matches = prune_top_k_candidates(candidate_matches, top_k=5)
-
             final_matches = quadratic_programming(pruned_matches)
-
-            # Evaluate matches
             metrics = evaluate_matches(final_matches, pairs)
+            metrics.update({"filename": fn, "matcher": "JASPER"})
             all_metrics.append(metrics)
-            print(f"Precision: {metrics['precision']:.2f}, Recall: {metrics['recall']:.2f}, F1 Score: {metrics['f1_score']:.2f}", flush=True)
-
-
+            print(f"JASPER: P={metrics['precision']:.2f}, R={metrics['recall']:.2f}, F1={metrics['f1_score']:.2f}", flush=True)
 
         else:
-            raise ValueError("Invalid mode. Choose from: " + ", ".join(["valentine", "jasper"]))
+            raise ValueError("Invalid mode. Choose from: valentine, jasper")
 
-    end_time = time.time()
-    print(f"\nTotal execution time: {end_time - start_time:.2f} seconds", flush=True)
+    # 5. Compute aggregated results
+    avg_scores = defaultdict(lambda: {"precision": [], "recall": [], "f1_score": []})
+    for m in all_metrics:
+        matcher = m["matcher"]
+        avg_scores[matcher]["precision"].append(m["precision"])
+        avg_scores[matcher]["recall"].append(m["recall"])
+        avg_scores[matcher]["f1_score"].append(m["f1_score"])
 
-    # Optionally: average metrics over all runs
-    #if all_metrics:
-    #    avg = lambda k: round(sum(m[k] for m in all_metrics) / len(all_metrics), 2)
-    #    print(f"\nAveraged Metrics across {len(all_metrics)} datasets:")
-    #    print(f"Precision: {avg('precision')}, Recall: {avg('recall')}, F1 Score: {avg('f1_score')}", flush=True)
+    # Compute mean per matcher
+    summary = {}
+    for matcher, scores in avg_scores.items():
+        summary[matcher] = {
+            "avg_precision": sum(scores["precision"]) / len(scores["precision"]),
+            "avg_recall": sum(scores["recall"]) / len(scores["recall"]),
+            "avg_f1": sum(scores["f1_score"]) / len(scores["f1_score"]),
+            "n_datasets": len(scores["precision"])
+        }
+
+    # 6. Save everything
+    results = {
+        "per_dataset": all_metrics,
+        "summary": summary,
+        "total_datasets": len(selected_datasets),
+        "execution_time_sec": round(time.time() - start_time, 2)
+    }
+
+    with open(output_file, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"\nSaved results to {output_file}")
 
 
 if __name__ == "__main__":
