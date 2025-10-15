@@ -55,7 +55,8 @@ def collect_all_paths(docs):
     """
     all_paths = set()
     for doc in docs:
-        all_paths.update(extract_paths(doc))
+        if isinstance(doc, (dict, list)):
+            all_paths.update(extract_paths(doc))
     return sorted(all_paths)
 
 def extract_leaf_key(paths):
