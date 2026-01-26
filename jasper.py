@@ -19,7 +19,13 @@ from tqdm import tqdm
 from valentine import valentine_match
 from valentine.algorithms import Coma, Cupid, DistributionBased, JaccardDistanceMatcher, SimilarityFlooding
 
-
+VALENTINE_MATCHERS = {
+    "coma": lambda: Coma(java_xmx="4g"),
+    "cupid": lambda: Cupid(),
+    "jaccard": lambda: JaccardDistanceMatcher(),
+    "distribution": lambda: DistributionBased(),
+    "similarityflooding": lambda: SimilarityFlooding()
+}
 
 # ----------------------------
 # Type compatibility functions for Jasper
@@ -93,25 +99,6 @@ def combined_embedding(path_emb, value_emb, alpha=0.6):
     return (alpha * path_emb + (1-alpha) * value_emb) / \
            (alpha * path_emb + (1-alpha) * value_emb).norm()
 
-def get_linguistic_similarity(source_combined_emb, target_combined_emb):
-    """
-    Compute cosine similarity between two precomputed embeddings.
-
-    Args:
-        source_combined_emb (torch.Tensor): Embedding for source path.
-        target_combined_emb (torch.Tensor): Embedding for target path.
-
-    Returns:
-        float: Cosine similarity score between -1 and 1.
-    """
-    if source_combined_emb is None or target_combined_emb is None:
-        return 0.0
-    if not isinstance(source_combined_emb, torch.Tensor):
-        source_combined_emb = torch.tensor(source_combined_emb, dtype=torch.float32)
-    if not isinstance(target_combined_emb, torch.Tensor):
-        target_combined_emb = torch.tensor(target_combined_emb, dtype=torch.float32)
-
-    return F.cosine_similarity(source_combined_emb.unsqueeze(0), target_combined_emb.unsqueeze(0), dim=1).item()
 
 
 # ----------------------------
@@ -195,60 +182,111 @@ def get_structural_similarity(s_row, t_row, w_depth=0.25, w_sibling=0.5, w_entro
 # ----------------------------
 # Jasper matching functions
 # ----------------------------
-def decode_embedding(b64_str):
-    """
-    Decode a base64-encoded string of the embedding to a numpy float32 array.
-    Args:
-        b64_str (str): Base64-encoded string.
-    Returns:
-        np.ndarray: Decoded numpy array of type float32.
-    """
-    if not b64_str:
-        return np.array([], dtype=np.float32)
-    return np.frombuffer(base64.b64decode(b64_str), dtype=np.float32)
 
-def match_paths(source_df, target_df, ling_weight=0.3, struct_weight=0.7, min_score=0.7):
+def decode_embedding(b64_string, dim=None):
+    """
+    Decode a base64-encoded embedding back to a numpy array.
+
+    Args:
+        b64_string (str): Base64 string of float32 array.
+        dim (int, optional): dimension of embedding. Needed if you want to reshape.
+    Returns:
+        np.ndarray
+    """
+    if not b64_string:
+        if dim is not None:
+            return np.zeros(dim, dtype=np.float32)
+        else:
+            return np.array([], dtype=np.float32)
+    
+    # Decode from base64 to bytes, then interpret as float32
+    byte_data = base64.b64decode(b64_string)
+    arr = np.frombuffer(byte_data, dtype=np.float32)
+    
+    if dim is not None:
+        arr = arr.reshape(dim)
+    
+    return arr
+
+def compute_combined_embeddings(df, device):
+    """
+    Decode and combine path/value embeddings for a DataFrame.
+    Returns a normalized tensor of shape [N, d].
+
+    Args:
+        df (pd.DataFrame): DataFrame with 'path_emb' and 'values_emb' columns.
+        device (str): Device to place the tensor on.
+    Returns:
+        torch.Tensor: Normalized combined embeddings.
+    """
+    embeddings = []
+
+    for row in df.itertuples(index=False):
+        path_emb = torch.tensor(
+            decode_embedding(row.path_emb), dtype=torch.float32
+        )
+        value_emb = torch.tensor(
+            decode_embedding(row.values_emb), dtype=torch.float32
+        )
+        combined = combined_embedding(path_emb, value_emb)
+        embeddings.append(combined)
+
+    emb = torch.stack(embeddings).to(device)
+    emb = torch.nn.functional.normalize(emb, dim=1)
+    return emb
+
+def match_paths(source_df, target_df, ling_weight=0.3, struct_weight=0.7, min_score=0.7, device="cuda"):
     """
     Match paths from two sets using precomputed embeddings and structural similarity.
-
     Args:
-        source_df, target_df (DataFrame): Source and target DataFrames containing path statistics.
+        source_df (pd.DataFrame): Source dataset.
+        target_df (pd.DataFrame): Target dataset.
         ling_weight (float): Weight for linguistic similarity.
         struct_weight (float): Weight for structural similarity.
         min_score (float): Minimum score threshold to consider a match.
-
+        device (str): Device to use for tensor computations.
     Returns:
         dict: {source_path: [(target_path, score), ...]}
     """
+
     source_df = source_df.copy()
     target_df = target_df.copy()
     source_df["path"] = source_df["path"].astype(str)
     target_df["path"] = target_df["path"].astype(str)
-    
+
+    # Precompute combined embeddings
+    source_emb = compute_combined_embeddings(source_df, device)
+    target_emb = compute_combined_embeddings(target_df, device)
+
+    # Calculate linguistic similarity matrix
+    ling_sim = source_emb @ target_emb.T
+
+    # Structural similarity + type compatibility
+    source_rows = list(source_df.itertuples(index=False))
+    target_rows = list(target_df.itertuples(index=False))
+
     matches = defaultdict(list)
 
-    for _, s_row in source_df.iterrows():
-        for _, t_row in target_df.iterrows():
-            if not are_types_compatible(s_row["types"], t_row["types"]):
+    for i, s_row in enumerate(source_rows):
+        for j, t_row in enumerate(target_rows):
+
+            # Check type compatibility
+            if not are_types_compatible(s_row.types, t_row.types):
                 continue
 
-            # Convert stringified embeddings to tensors
-            source_path_emb = torch.tensor(decode_embedding(s_row["path_emb"]), dtype=torch.float32)
-            source_value_emb = torch.tensor(decode_embedding(s_row["values_emb"]), dtype=torch.float32)
-            target_path_emb = torch.tensor(decode_embedding(t_row["path_emb"]), dtype=torch.float32)
-            target_value_emb = torch.tensor(decode_embedding(t_row["values_emb"]), dtype=torch.float32)
+            # Get the linguistic score from precomputed matrix
+            ling_score = float(ling_sim[i, j])
 
-            # Combine embeddings
-            source_combined_emb = combined_embedding(source_path_emb, source_value_emb)
-            target_combined_emb = combined_embedding(target_path_emb, target_value_emb)
+            # Get structural similarity score
+            struct_score = get_structural_similarity(
+                s_row._asdict(),
+                t_row._asdict(),
+            )
 
-            # Compute similarity
-            ling_score = get_linguistic_similarity(source_combined_emb, target_combined_emb)
-            struct_score = get_structural_similarity(s_row, t_row)
+            # Combine scores
             final_score = ling_weight * ling_score + struct_weight * struct_score
-
             if final_score >= min_score:
-                matches[s_row["path"]].append((t_row["path"], final_score))
+                matches[s_row.path].append((t_row.path, final_score))
 
     return matches
 
@@ -268,124 +306,90 @@ def prune_top_k_candidates(candidate_matches, top_k=5):
         pruned[s_path] = sorted(targets, key=lambda x: -x[1])[:top_k]
     return pruned
 
-def predict_matches(source_vars):
+def parent_path(path):
+    if "." not in path:
+        return None
+    return path.rsplit(".", 1)[0]
+
+def refine_scores(match_dict, alpha=0.2):
     """
-    Selects final match from optimized source_vars.
+    Adjust scores with nesting consistency.
 
     Args:
-        source_vars (dict): Maps source paths to list of (var, target_path, score).
+        match_dict: {source: [(target, score)]}
+        alpha: bonus for parent match
 
     Returns:
-        dict: {source_path: [(target_path, score)]} — ready for evaluation
+        {(source, target): adjusted_score}
     """
-    final_matching = {}
+    # Compute best target per source
+    best_target = {}
+    for s, tgts in match_dict.items():
+        if tgts:
+            best_target[s] = max(tgts, key=lambda x: x[1])[0]
 
-    for s_path, var_list in source_vars.items():
-        for var, t_path, score in var_list:
-            try:
-                if hasattr(var, "X") and round(var.X):
-                    final_matching[s_path] = [(t_path, score)]
-                    break
-            except Exception as e:
-                print(f"[Error] Reading var.X for {s_path}->{t_path}: {e}")
+    refined = {}
 
-    # Sort by descending score
-    final_matching = dict(sorted(final_matching.items(), key=lambda x: -x[1][0][1]))
+    for s, tgts in match_dict.items():
+        s_parent = parent_path(s)
 
-    return final_matching
+        for t, score in tgts:
+            t_parent = parent_path(t)
+            bonus = 0.0
+            if s_parent and t_parent and best_target.get(s_parent) == t_parent:
+                bonus = alpha
 
-def get_key_prefix(key):
+            refined[(s, t)] = score + bonus
+
+    return refined
+
+def select_top_k_matches(refined_pairs, top_k=1):
     """
-    Get the prefix of a key.
+    Select up to top-k targets for each source.
 
     Args:
-        key (str): Target or source key.
+        refined_pairs: {(source, target): score}
+        top_k: number of top targets per source
 
     Returns:
-        str: The prefix of the key.
+        {(source, target): score}
     """
-    # If no dot in the key, the prefix is just the '$' symbol
-    if '.' not in key:
-        prefix = '$'
-    else:
-        prefix, _ = key.rsplit('.', maxsplit=1)  # Split at the last dot
-        prefix = '$.' + prefix  # Add '$.' to indicate the start of the path
-    return prefix
 
-def quadratic_programming(match_dict):
+    per_source = defaultdict(list)
+
+    # group by source
+    for (s, t), score in refined_pairs.items():
+        per_source[s].append((t, score))
+
+    top_k_matches = {}
+
+    # select top-k per source
+    for s, tgts in per_source.items():
+        tgts.sort(key=lambda x: x[1], reverse=True)
+        for t, score in tgts[:top_k]:
+            top_k_matches[(s, t)] = score
+
+    return top_k_matches
+    
+def final_match(pruned_pairs, alpha=0.2, top_k=1):
     """
-    Solves optimal source-target JSON path matching via quadratic programming and returns final matches.
+    Final matching with score refinement and top-k selection.
 
     Args:
-        match_dict (dict): {(target_path, source_path): score}
-
+        pruned_pairs: {source: [(target, score)]}
+        alpha: nesting bonus
+        top_k: max targets per source
     Returns:
-        dict: {source_path: (target_path, score)} — best match per source
+        {(source, target): adjusted_score}
     """
-    quadratic_model = Model("json_matching")
-    quadratic_model.setParam("OutputFlag", False)
+    refined = refine_scores(pruned_pairs, alpha=alpha)
+    return select_top_k_matches(refined, top_k=top_k)
 
-    nested_t_vars = {}
-    nested_s_vars = {}  
-    prefix_vars = {}
-    source_vars = defaultdict(list)
-    score_terms = []
-
-
-    for s_path, t_matches in match_dict.items():
-        s_prefix = 's' + get_key_prefix(s_path)
-        for t_path, score in t_matches:
-            t_prefix = 't' + get_key_prefix(t_path)
-
-            # Binary variable: 1 if source_path matches target_path
-            match_var = quadratic_model.addVar(vtype=GRB.BINARY, name=f"{s_path}-----{t_path}")
-            score_terms.append(score * match_var)
-            source_vars[s_path].append((match_var, t_path, score))
-
-            # Prefix_var: 1 if any matching under the prefix pair exists
-            prefix_key = f'{s_prefix}-----{t_prefix}'
-            if prefix_key not in prefix_vars:
-                prefix_vars[prefix_key] = quadratic_model.addVar(vtype=GRB.BINARY, name=prefix_key)
-            prefix_var = prefix_vars[prefix_key]
-            
-            # Nested_t_var: 1 if target_path matches any source_path with given prefix
-            t_nest_key = f'{t_path}-----{s_prefix}'
-            if t_nest_key not in nested_t_vars:
-                nested_t_vars[t_nest_key] = quadratic_model.addVar(vtype=GRB.BINARY, name=t_nest_key)
-            nested_t_var = nested_t_vars[t_nest_key]
-
-            # Nested_s_var: 1 if source_path matches any target_path with given prefix
-            s_nest_key = f'{s_path}-----{t_prefix}'
-            if s_nest_key not in nested_s_vars:           
-                nested_s_vars[s_nest_key] = quadratic_model.addVar(vtype=GRB.BINARY, name=s_nest_key)
-            nested_s_var = nested_s_vars[s_nest_key]
-
-            quadratic_model.addConstr(nested_t_var <= prefix_var, name=f"c_tprefix_{t_path}_{s_path}")
-            quadratic_model.addConstr(nested_s_var <= prefix_var, name=f"c_sprefix_{t_path}_{s_path}")
-
-    # Each source path matches at most one target path
-    for s_path, var_list in source_vars.items():
-        quadratic_model.addConstr(quicksum(var for var, _, _ in var_list) <= 1, name=f"c_unique_{s_path}")
-
-    quadratic_model.update()
-    quadratic_model.setObjective(quicksum(score_terms), GRB.MAXIMIZE)
-    quadratic_model.optimize()
-
-    if quadratic_model.status != GRB.OPTIMAL:
-        print(f"Warning: Model was not solved optimally. Status: {quadratic_model.status}")
-        if quadratic_model.status == GRB.INFEASIBLE:
-            quadratic_model.computeIIS()
-            quadratic_model.write("iis.ilp")
-            print("Model is infeasible. See 'iis.ilp'.")
-        return {}
-
-    return predict_matches(source_vars)
-
+    
 
 # ----------------------------
 # Step 1: Load SOURCE and TARGET datasets
 # ----------------------------
-
 def path_dict_to_df(path_dict):
     """
     Convert a path_dict to a DataFrame.
@@ -399,6 +403,8 @@ def path_dict_to_df(path_dict):
     flat_dict = {path: list(values)[0] if values else None for path, values in path_dict.items()}
     return pd.DataFrame([flat_dict])
 
+def load_dataset(path):
+    return pd.read_csv(path, delimiter=";")
 
 # -----------------------------
 # Step 2: Select datasets to evaluate
@@ -479,30 +485,7 @@ def sample_datasets_from_bins(bins, total_sample):
     return selected
 
 
-def decode_embedding(b64_string, dim=None):
-    """
-    Decode a base64-encoded embedding back to a numpy array.
 
-    Args:
-        b64_string (str): Base64 string of float32 array.
-        dim (int, optional): dimension of embedding. Needed if you want to reshape.
-    Returns:
-        np.ndarray
-    """
-    if not b64_string:
-        if dim is not None:
-            return np.zeros(dim, dtype=np.float32)
-        else:
-            return np.array([], dtype=np.float32)
-    
-    # Decode from base64 to bytes, then interpret as float32
-    byte_data = base64.b64decode(b64_string)
-    arr = np.frombuffer(byte_data, dtype=np.float32)
-    
-    if dim is not None:
-        arr = arr.reshape(dim)
-    
-    return arr
 
 def embed_mean(x):
     """Compute mean embedding from a list of embeddings."""
@@ -588,7 +571,7 @@ def sample_datasets(source_dir, sample_fraction):
 
     # Find the best K and cluster
     best_k, scores = find_best_k(X_scaled)
-    print(f"Best k = {best_k}")
+    print(f"Best number of clusters = {best_k}")
 
     kmeans = KMeans(n_clusters=best_k, random_state=42, n_init="auto")
     agg["cluster"] = kmeans.fit_predict(X_scaled)
@@ -615,46 +598,25 @@ def sample_datasets(source_dir, sample_fraction):
 # ----------------------------
 # Step 3: Apply matching algorithm
 # ----------------------------
-def find_valentine(target_df, source_df):
-    """
-    Run multiple Valentine matching algorithms and return their results.
-
-    Args:
-        target_df (pd.DataFrame): Target dataset.
-        source_df (pd.DataFrame): Source dataset.
-    Returns:
-        dict: Dictionary with algorithm names as keys and their match results as values.
-    """
-    models = {
-        "SimilarityFlooding": SimilarityFlooding(),
-        "Coma": Coma(),
-        "DistributionBased": DistributionBased(),
-        "JaccardDistanceMatcher": JaccardDistanceMatcher(),
-        "Cupid": Cupid(),
-    }
-
-    results = {}
-    for name, matcher in models.items():
-        results[name] = valentine_match(target_df, source_df, matcher, "target", "source")
-
-    return results
-
 def reformat_valentine_matches(valentine_matches):
     """
-    Reformat Valentine matches to {source_path: [(target_path, score), ...]}.
+    Remove the first element of the paths in Valentine matches.
+    It's necessary because Valentine returns paths with a labelled "source" or "target" at the beginning.
 
     Args:
-        valentine_matches (dict): Output from find_valentine.
+        valentine_matches (dict): {(source_path,(target_path): score)}
+
     Returns:
-        dict: Reformatted matches.
+        dict: {(source_path, target_path): score}
     """
     matches = defaultdict(list)
-    for (target_tuple, source_tuple), score in valentine_matches.items():
-        target_path = target_tuple[1]
-        source_path = source_tuple[1]
-        matches[source_path].append((target_path, score))
-    return matches
 
+    for (tgt, src), score in valentine_matches.items():
+        new_tgt = ".".join(tgt[1:])
+        new_src = ".".join(src[1:])
+        matches[(new_src, new_tgt)].append(score)
+
+    return matches
 
 # ----------------------------
 # Step 4: Evaluate matches against ground truth
@@ -691,20 +653,17 @@ def evaluate_matches(matches, ground_truth_pairs):
     restricted to the source paths found in `matches`.
 
     Args:
-        matches (dict): {source_path: [(target_path, score), ...]}
+        matches (dict): Predicted matches in the form {(source_path, target_path): score}.
         ground_truth_pairs (set): Set of (source, target) pairs representing ground truth.
 
     Returns:
         dict: Evaluation metrics.
     """
-    # Flatten matches to (source, target) pairs
-    predicted_pairs = set()
-    for s_path, targets in matches.items():
-        for t_path, score in targets:
-            predicted_pairs.add((s_path, t_path))
+    # Get all source-target pairs in predicted matches
+    predicted_pairs = set(matches.keys())   
 
     # Compute intersections and differences
-    true_positives = ground_truth_pairs & predicted_pairs
+    true_positives = ground_truth_pairs & predicted_pairs    
     false_positives = predicted_pairs - ground_truth_pairs
     false_negatives = ground_truth_pairs - predicted_pairs
 
@@ -735,6 +694,26 @@ def evaluate_matches(matches, ground_truth_pairs):
         "false_negatives": fn,
     }
 
+def evaluate_valentine(source_df, target_df, gt_pairs, matcher_name, matcher_instance):
+    """Run Valentine matcher and evaluate."""
+    new_source_df = pd.DataFrame(columns=source_df["path"].astype(str))
+    new_target_df = pd.DataFrame(columns=target_df["path"].astype(str))
+
+    matches = valentine_match(new_target_df, new_source_df, matcher_instance, "target", "source")
+    formatted_matches = reformat_valentine_matches(matches)
+    metrics = evaluate_matches(formatted_matches, gt_pairs)
+    return metrics
+
+def evaluate_jasper(source_df, target_df, gt_pairs, device):
+    """Run Jasper matcher and evaluate."""
+    candidate_matches = match_paths(source_df, target_df, ling_weight=0.5, struct_weight=0.5, min_score=0.7, device=device)
+    pruned_matches = prune_top_k_candidates(candidate_matches, top_k=5)
+    pruned_pairs = {s: [(t, score) for t, score in tgts] for s, tgts in pruned_matches.items()}
+    final_matches = final_match(pruned_pairs, alpha=0.2, top_k=1)
+    metrics = evaluate_matches(final_matches, gt_pairs)
+    metrics.update({"matcher": "JASPER"})
+    return metrics
+
 
 # ----------------------------
 # Step 5: CLI
@@ -744,124 +723,72 @@ def parse_args():
     parser.add_argument("source_dir", help="Directory with source csv files")
     parser.add_argument("target_dir", help="Directory with target csv files")
     parser.add_argument("groundtruth_file", help="Path to ground truth JSON file.")
-    parser.add_argument("mode", choices=["valentine", "jasper"], help="Matching algorithm to use.")
+    parser.add_argument("mode", choices=["coma", "cupid", "jaccard", "distribution", "similarityflooding", "jasper"], help="Matching algorithm to use.")
     return parser.parse_args()
 
 def main():
-    all_metrics = []  # stores metrics for each matcher-dataset pair
-    output_file = "jasper_results_200_0.7lw_0.3sw_0.6a_0.5sib.json"
     start_time = time.time()
-    top_ks = [1, 5, 10, 15, 20]
-
-    # 1. Sample datasets
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     args = parse_args()
-    mode = args.mode
-    selected_datasets = sample_datasets(args.source_dir, sample_fraction=0.20)
-    print(f"Evaluating {len(selected_datasets)} datasets. Mode: {mode}", flush=True)
-    
-    # 2. Run matching and evaluation
-    for filename in tqdm(sorted(selected_datasets), desc="Processing datasets", total=len(selected_datasets)):
-        source_df = pd.read_csv(Path(args.source_dir) / filename.replace(".json", ".csv"), delimiter=";")
-        target_df = pd.read_csv(Path(args.target_dir) / filename.replace(".json", ".csv"), delimiter=";")
 
+    # Sample datasets
+    selected_datasets = sample_datasets(args.source_dir, sample_fraction=1.0)
+    print(f"Evaluating {len(selected_datasets)} datasets. Mode: {args.mode}", flush=True)
+
+    # Initialize matcher once
+    if args.mode in VALENTINE_MATCHERS:
+        matcher_instance = VALENTINE_MATCHERS[args.mode]()
+        mode_type = "valentine"
+    elif args.mode == "jasper":
+        matcher_instance = None
+        mode_type = "jasper"
+    else:
+        raise ValueError("Invalid mode. Choose from Valentine matcher keys or 'jasper'")
+
+    min_paths = 100
+    max_paths = 500
+    precision_list = []
+    recall_list = []
+    f1_list = []
+
+    for filename in tqdm(sorted(selected_datasets), desc="Processing datasets"):
+        source_path = Path(args.source_dir) / filename.replace(".json", ".csv")
+        target_path = Path(args.target_dir) / filename.replace(".json", ".csv")
+        source_df = load_dataset(source_path)
+        target_df = load_dataset(target_path)
         gt_pairs = get_ground_truth_pairs(args.groundtruth_file, filename)
-        print(f"\nProcessing {filename}: {len(source_df)} → {len(target_df)} paths, {len(gt_pairs)} GT pairs.", flush=True)
 
-        if mode == "valentine":
-            new_source_df = pd.DataFrame(1, index=range(len(source_df)), columns=source_df["path"].astype(str))
-            new_target_df = pd.DataFrame(1, index=range(len(target_df)), columns=target_df["path"].astype(str))
-            valentine_matches = find_valentine(new_target_df, new_source_df)
+        #if len(source_df) > min_paths and len(source_df) < max_paths:
+        #if len(source_df) <= min_paths:
+        if len(source_df) >= max_paths:
+            print(f"\nProcessing {filename}: {len(source_df)} → {len(target_df)} paths, {len(gt_pairs)} GT pairs.", flush=True)
 
-            for matcher_name, matches in tqdm(valentine_matches.items(), desc="Processing Valentine matches", total=len(valentine_matches)):
-                formatted_matches = reformat_valentine_matches(matches)
-                final_matches = {k: sorted(v, key=lambda x: -x[1])[0:1] for k, v in formatted_matches.items()}
-                metrics = evaluate_matches(final_matches, gt_pairs)
-                metrics.update({"filename": filename, "matcher": matcher_name})
-                all_metrics.append(metrics)
-                print(f"{matcher_name}: P={metrics['precision']:.2f}, R={metrics['recall']:.2f}, F1={metrics['f1_score']:.2f}", flush=True)
+            if mode_type == "valentine":
+                metrics = evaluate_valentine(source_df, target_df, gt_pairs, args.mode, matcher_instance)
+            else:
+                metrics = evaluate_jasper(source_df, target_df, gt_pairs, device=device)
 
-        elif mode == "jasper":
-            candidate_matches = match_paths(source_df, target_df, ling_weight=0.5, struct_weight=0.5, min_score=0.7)
+            metrics.update({"filename": filename})
 
-            for k in top_ks:
-                pruned_matches = prune_top_k_candidates(candidate_matches, top_k=k)
+            print(f"Metrics for {filename}: P={metrics['precision']:.2f}, R={metrics['recall']:.2f}, F1={metrics['f1_score']:.2f}", flush=True)
+            precision_list.append(metrics['precision'])
+            recall_list.append(metrics['recall'])
+            f1_list.append(metrics['f1_score'])
 
-                # Flatten pruned candidates into a set of (source, target)
-                pruned_pairs = {(s, t) for s, tgts in pruned_matches.items() for t, _ in tgts}
+    # Print average precision, recall, f1 to nearest 2 decimals
+    print(f"\n=== Overall Evaluation  of  {args.mode} ===", flush=True)
+    avg_precision = sum(precision_list) / len(precision_list) if precision_list else 0
+    avg_recall = sum(recall_list) / len(recall_list) if recall_list else 0
+    avg_f1 = sum(f1_list) / len(f1_list) if f1_list else 0
+    print(f"Average Precision: {avg_precision:.2f}", flush=True)
+    print(f"Average Recall:    {avg_recall:.2f}", flush=True)
+    print(f"Average F1 Score:  {avg_f1:.2f}", flush=True)   
 
-                # Compute recall: fraction of GT pairs that appear in top-k candidates
-                true_covered = len(gt_pairs & pruned_pairs)
-                recall_at_k = true_covered / len(gt_pairs) if gt_pairs else 0.0
-
-                metrics = {
-                    "filename": filename,
-                    "matcher": "JASPER",
-                    "k": k,
-                    "recall_at_k": recall_at_k,
-                    "covered": true_covered,
-                    "total_gt": len(gt_pairs)
-                }
-                all_metrics.append(metrics)
-
-                print(
-                    f"JASPER={k}: Recall={recall_at_k:.3f} "
-                    f"({true_covered}/{len(gt_pairs)} GT pairs covered)",
-                    flush=True
-                )
-                
-
-            #final_matches = quadratic_programming(pruned_matches)
-            #metrics = evaluate_matches(final_matches, pairs)
-            #metrics.update({"filename": fn, "matcher": "JASPER"})
-            #all_metrics.append(metrics)
-            #print(f"JASPER: P={metrics['precision']:.2f}, R={metrics['recall']:.2f}, F1={metrics['f1_score']:.2f}", flush=True)
-            avg_recall = defaultdict(list)
-            for m in all_metrics:
-                avg_recall[m["k"]].append(m["recall_at_k"])
-
-            summary = {
-                f"recall_at_{k}": sum(v) / len(v)
-                for k, v in avg_recall.items()
-            }
-            print("\nAverage Recall_at_k across all datasets:")
-            for k, val in summary.items():
-                print(f"  k={k}: {val:.3f}")
-        else:
-            raise ValueError("Invalid mode. Choose from: valentine, jasper")
-    
-    # 5. Compute aggregated results
-    avg_scores = defaultdict(lambda: {"precision": [], "recall": [], "f1_score": []})
-    for m in all_metrics:
-        matcher = m["matcher"]
-        avg_scores[matcher]["precision"].append(m["precision"])
-        avg_scores[matcher]["recall"].append(m["recall"])
-        avg_scores[matcher]["f1_score"].append(m["f1_score"])
-
-    # Compute mean per matcher
-    summary = {}
-    for matcher, scores in avg_scores.items():
-        summary[matcher] = {
-            "avg_precision": sum(scores["precision"]) / len(scores["precision"]),
-            "avg_recall": sum(scores["recall"]) / len(scores["recall"]),
-            "avg_f1": sum(scores["f1_score"]) / len(scores["f1_score"]),
-            "n_datasets": len(scores["precision"])
-        }
-
-    # 6. Save everything
-    results = {
-        "per_dataset": all_metrics,
-        "summary": summary,
-        "total_datasets": len(selected_datasets),
-        "execution_time_sec": round(time.time() - start_time, 2)
-    }
-
-    with open(output_file, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"\nSaved results to {output_file}")
-    
+    print(f"Execution time: {round(time.time() - start_time, 2)} seconds", flush=True)
 
 if __name__ == "__main__":
     main()
+
 
 
 # As k increases, how is f1 score affected
