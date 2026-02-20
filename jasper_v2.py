@@ -18,16 +18,11 @@ from tqdm import tqdm
 # CONFIG
 # -----------------------------
 NUM_EPOCHS = 25
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 2e-5
 HIDDEN_DIM = 256
 OUT_DIM = 128
 CODEBERT_DIM = 768
-STRUCT_DIM = 4   # depth, degree, leaf, children
-STRUCT_HIDDEN = 32
-
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
 
 # -----------------------------
 # DATA UTILITIES
@@ -69,6 +64,45 @@ def decode_embedding(b64_string, dim=CODEBERT_DIM):
     arr = np.frombuffer(byte_data, dtype=np.float32)
     return arr.reshape(dim)
 
+def combine_embeddings(df, graph, dim=CODEBERT_DIM):
+    """
+    Combine path and value embeddings for each node in the graph. 
+
+    Args:
+        df: DataFrame containing 'path', 'path_emb', and 'values_emb' columns
+        graph: networkx Graph with nodes corresponding to paths in df
+        dim: dimension of each individual embedding (path and value)
+    Returns:
+        Tensor of shape (num_nodes, dim*2) containing combined embeddings for each node
+    """
+    df_lookup = {row.path: row for row in df.itertuples(index=False)}
+    embeddings = []
+
+    for node in graph.nodes():
+        row = df_lookup.get(node)
+
+        if row is None:
+            path_emb = torch.zeros(dim)
+            value_emb = torch.zeros(dim)
+
+        else:
+            path_emb = torch.tensor(
+                decode_embedding(row.path_emb),
+                dtype=torch.float32
+            )
+
+            value_emb = torch.tensor(
+                decode_embedding(row.values_emb),
+                dtype=torch.float32
+            )
+
+        combined = torch.cat([path_emb, value_emb], dim=0)
+        embeddings.append(combined)
+
+    emb = torch.stack(embeddings).to(device)
+
+    return F.normalize(emb, dim=1)
+
 def get_ground_truth_pairs(ground_truth_path, filename):
     """
     Load ground truth pairs for a specific filename from the ground truth file.
@@ -96,6 +130,64 @@ def get_ground_truth_pairs(ground_truth_path, filename):
 
     return gt
 
+def convert_gt_to_indices(gt_pairs, source_nodes, target_nodes):
+    """
+    Convert ground truth pairs of node names into index pairs based on their positions in the source and target node lists.
+
+    Args:
+        gt_pairs: set of (source_node, target_node) pairs that are ground truth matches
+        source_nodes: list of node names in the source graph
+        target_nodes: list of node names in the target graph
+    Returns:    
+        list of (source_index, target_index) pairs corresponding to the ground truth matches
+    """
+    src_map = {node: i for i, node in enumerate(source_nodes)}
+    tgt_map = {node: j for j, node in enumerate(target_nodes)}
+
+    indices = []
+
+    for src, tgt in gt_pairs:
+        if src in src_map and tgt in tgt_map:
+            indices.append((src_map[src], tgt_map[tgt]))
+
+    return indices
+
+class JsonGraphPair:
+
+    def __init__(self, source_df, target_df, gt_pairs):
+
+        self.filename = source_df.attrs["filename"]
+
+        # ---- SOURCE GRAPH ----
+        graph_src = build_graph(source_df["path"])
+        self.source_nodes = list(graph_src.nodes())
+        self.source_edge_index = (
+            from_networkx(graph_src)
+            .edge_index
+            .long()
+            .to(device)
+        )
+        self.source_features = combine_embeddings(source_df, graph_src)
+
+        # ---- TARGET GRAPH ----
+        graph_tgt = build_graph(target_df["path"])
+        self.target_nodes = list(graph_tgt.nodes())
+        self.target_edge_index = (
+            from_networkx(graph_tgt)
+            .edge_index
+            .long()
+            .to(device)
+        )
+        self.target_features = combine_embeddings(target_df, graph_tgt)
+
+        # ---- GROUND TRUTH ----
+        self.gt_pairs = gt_pairs
+        self.gt_indices = convert_gt_to_indices(
+            gt_pairs,
+            self.source_nodes,
+            self.target_nodes
+        )
+
 def split_pairs(pairs, train_ratio=0.7, val_ratio=0.15, seed=42):
     """
     Split a list of JsonGraphPair objects into train, validation, and test sets based on specified ratios.
@@ -119,165 +211,21 @@ def split_pairs(pairs, train_ratio=0.7, val_ratio=0.15, seed=42):
 
     return pairs[:train_end], pairs[train_end:val_end], pairs[val_end:]
 
-def convert_gt_to_indices(gt_pairs, source_nodes, target_nodes):
-    """
-    Convert ground truth pairs of node names into index pairs based on their positions in the source and target node lists.
 
-    Args:
-        gt_pairs: set of (source_node, target_node) pairs that are ground truth matches
-        source_nodes: list of node names in the source graph
-        target_nodes: list of node names in the target graph
-    Returns:    
-        list of (source_index, target_index) pairs corresponding to the ground truth matches
-    """
-    src_map = {node: i for i, node in enumerate(source_nodes)}
-    tgt_map = {node: j for j, node in enumerate(target_nodes)}
-
-    indices = []
-
-    for src, tgt in gt_pairs:
-        if src in src_map and tgt in tgt_map:
-            indices.append((src_map[src], tgt_map[tgt]))
-
-    return indices
-
-def compute_structural_features(graph):
-    """
-    Compute structural features for each node in the graph: depth, degree, is_leaf, num_children.
-
-    Args:
-        graph: networkx Graph object
-    Returns:        
-        Tensor of shape (num_nodes, STRUCT_DIM) containing structural features for each node
-    """
-
-    features = []
-
-    for node in graph.nodes():
-        depth = node.count('.') + 1
-        degree = graph.degree[node]
-        neighbors = list(graph.neighbors(node))
-        num_children = sum(1 for n in neighbors if n.startswith(node + '.'))
-
-        is_leaf = 1.0 if num_children == 0 else 0.0
-
-        features.append([
-            float(depth),
-            float(degree),
-            float(is_leaf),
-            float(num_children)
-        ])
-
-    return torch.tensor(features, dtype=torch.float32)
-
-def combine_embeddings(df, graph, dim=CODEBERT_DIM):
-
-    df_lookup = {row.path: row for row in df.itertuples(index=False)}
-    embeddings = []
-
-    for node in graph.nodes():
-
-        row = df_lookup.get(node)
-
-        if row is None:
-            path_emb = torch.zeros(dim)
-            value_emb = torch.zeros(dim)
-        else:
-            path_emb = torch.tensor(decode_embedding(row.path_emb), dtype=torch.float32)
-            value_emb = torch.tensor(decode_embedding(row.values_emb), dtype=torch.float32)
-
-        semantic = torch.cat([path_emb, value_emb], dim=0)
-        embeddings.append(semantic)
-
-    emb = torch.stack(embeddings).to(device)
-
-    return F.normalize(emb, dim=1)
-
-
-
-class JsonGraphPair:
-
-    def __init__(self, source_df, target_df, gt_pairs):
-
-        self.filename = source_df.attrs["filename"]
-
-        # ---- SOURCE GRAPH ----
-        graph_src = build_graph(source_df["path"])
-        self.source_nodes = list(graph_src.nodes())
-        self.source_edge_index = (
-            from_networkx(graph_src)
-            .edge_index
-            .long()
-            .to(device)
-        )
-        self.source_semantic = combine_embeddings(source_df, graph_src)
-        self.source_structural = compute_structural_features(graph_src).to(device)
-
-
-        # ---- TARGET GRAPH ----
-        graph_tgt = build_graph(target_df["path"])
-        self.target_nodes = list(graph_tgt.nodes())
-        self.target_edge_index = (
-            from_networkx(graph_tgt)
-            .edge_index
-            .long()
-            .to(device)
-        )
-        self.target_semantic = combine_embeddings(target_df, graph_tgt)
-        self.target_structural = compute_structural_features(graph_tgt).to(device)
-
-        # ---- GROUND TRUTH ----
-        self.gt_pairs = gt_pairs
-        self.gt_indices = convert_gt_to_indices(
-            gt_pairs,
-            self.source_nodes,
-            self.target_nodes
-        )
- 
-        
 # -----------------------------
 # MODEL
 # -----------------------------
-class StructuralEncoder(torch.nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-        self.mlp = torch.nn.Sequential(
-            torch.nn.Linear(STRUCT_DIM, STRUCT_HIDDEN),
-            torch.nn.ReLU(),
-            torch.nn.Linear(STRUCT_HIDDEN, STRUCT_HIDDEN)
-        )
-
-    def forward(self, x):
-        return self.mlp(x)
-    
 class GCN(torch.nn.Module):
-
     def __init__(self):
         super().__init__()
-
-        self.struct_encoder = StructuralEncoder()
-
-        semantic_dim = CODEBERT_DIM * 2
-        fused_dim = semantic_dim + STRUCT_HIDDEN
-
-        self.conv1 = GCNConv(fused_dim, HIDDEN_DIM)
+        self.conv1 = GCNConv(CODEBERT_DIM*2, HIDDEN_DIM)
         self.conv2 = GCNConv(HIDDEN_DIM, OUT_DIM)
 
-    def forward(self, semantic_x, structural_x, edge_index):
-
-        struct_h = self.struct_encoder(structural_x)
-
-        fused = torch.cat([semantic_x, struct_h], dim=1)
-
-        h = self.conv1(fused, edge_index)
+    def forward(self, x, edge_index):
+        h = self.conv1(x, edge_index)
         h = F.relu(h)
         h = self.conv2(h, edge_index)
-
         return F.normalize(h, dim=1)
-
-
 
 
 # -----------------------------
@@ -346,65 +294,61 @@ def matching_loss(source_embs, target_embs, gt_indices, loss_fn):
 # -----------------------------
 def compute_global_pos_weight(train_pairs):
     """
-    Compute a global positive class weight for BCE loss based on the ratio of positive to negative pairs across the
-    entire training set.
-    
+    Compute a global positive class weight for BCE loss based on the ratio of positive to negative pairs across the entire training set.    
+
     Args:
         train_pairs: list of JsonGraphPair objects in the training set
     Returns:
-        pos_weight: float value to use as the pos_weight in BCEWithLogitsLoss to address class imbalance
+        pos_weight: float value to use as the pos_weight in BCEWithLogitsLoss
     """
 
     total_pos = 0
     total_entries = 0
 
     for pair in train_pairs:
-        Ns = pair.source_semantic.shape[0]
-        Nt = pair.target_semantic.shape[0]
-
+        Ns = pair.source_features.shape[0]
+        Nt = pair.target_features.shape[0]
         total_entries += Ns * Nt
         total_pos += len(pair.gt_indices)
 
     return (total_entries - total_pos) / (total_pos + 1e-8)
 
 def train_model(train_pairs, val_pairs):
+    """
+    Train GCN with BCE loss and evaluate on validation set each epoch.
 
+    Args:
+        train_pairs: list of JsonGraphPair objects for training
+        val_pairs: list of JsonGraphPair objects for validation
+    Returns:
+        model: trained GCN model
+    """
     wandb.init(project="json-graph-matching")
 
     model = GCN().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    pos_weight = compute_global_pos_weight(train_pairs)
-
-    loss_fn = torch.nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor(pos_weight, device=device)
-    )
-
     for epoch in tqdm(range(NUM_EPOCHS), desc="Training"):
+
         model.train()
         total_loss = 0.0
 
         for pair in train_pairs:
-
             optimizer.zero_grad()
 
-            z_src = model(pair.source_semantic,
-                          pair.source_structural,
-                          pair.source_edge_index)
+            # Forward pass
+            z_src = model(pair.source_features, pair.source_edge_index)
+            z_tgt = model(pair.target_features, pair.target_edge_index)
+            loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(compute_global_pos_weight(train_pairs)).to(device))
 
-            z_tgt = model(pair.target_semantic,
-                          pair.target_structural,
-                          pair.target_edge_index)
-
-            loss = matching_loss(z_src, z_tgt,
-                                 pair.gt_indices,
-                                 loss_fn)
-
+            # Compute BCE loss
+            loss = matching_loss(z_src, z_tgt, pair.gt_indices, loss_fn)
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
 
+        # Validation
         val_precision, val_recall, val_f1 = evaluate_model(model, val_pairs, silent=True)
 
         wandb.log({
@@ -415,8 +359,9 @@ def train_model(train_pairs, val_pairs):
             "val_f1": val_f1
         })
 
-    return model
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS} | Train Loss: {total_loss/len(train_pairs):.4f} | Val Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, F1: {val_f1:.4f}")
 
+    return model
 
 
 # -----------------------------
@@ -489,8 +434,8 @@ def evaluate_model(model, pairs, silent=False):
 
     with torch.no_grad():
         for pair in pairs:
-            z_src = model(pair.source_semantic,pair.source_structural, pair.source_edge_index)
-            z_tgt = model(pair.target_semantic,pair.target_structural, pair.target_edge_index)
+            z_src = model(pair.source_features, pair.source_edge_index)
+            z_tgt = model(pair.target_features, pair.target_edge_index)
 
             matches = match_graphs(z_src, z_tgt, pair.source_nodes, pair.target_nodes)
             precision, recall, f1 = compute_metrics(matches, pair.gt_pairs)
