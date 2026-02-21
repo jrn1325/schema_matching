@@ -37,19 +37,20 @@ def clean_object(obj):
     else:
         return obj
     
-def parse_document(doc, path=''):
+def parse_document(doc, path=()):
     """
     Parse JSON document and yield (path, value, siblings).
 
     Args:
         doc: JSON document (dict, list, or primitive)
+        path: tuple representing the current path
     Yields:
-        (path, value, siblings): tuple of path string, value, and number of siblings
+        (path, value, siblings): tuple of path tuple, value, and number of siblings
     """
     if isinstance(doc, dict):
         siblings = len(doc)
         for key, value in doc.items():
-            full_path = f"{path}.{key}" if path else key
+            full_path = path + (key,)
             cleaned_value = clean_object(value)
             
             yield (full_path, cleaned_value, siblings)
@@ -57,7 +58,7 @@ def parse_document(doc, path=''):
     elif isinstance(doc, list):
         siblings = len(doc)
         for item in doc:
-            full_path = f"{path}.{ARRAY_WILDCARD}"
+            full_path = path + (ARRAY_WILDCARD,)
             yield from parse_document(item, full_path)
     else:
         yield (path, doc, 0)
@@ -141,14 +142,13 @@ def calc_embeddings(values, model, tokenizer, batch_size=64):
 
 def extract_paths(docs):
     """
-    Extract paths and their stats from a list of JSON documents.
+    Extract paths and their stats from a list of JSON documents using tuple paths.
 
     Args:
         docs: list of JSON documents.
     Returns:
-        dict of path stats
+        dict of path stats keyed by tuple paths
     """
-
     path_stats = defaultdict(lambda: {
         "types": set(),
         "items_type": set(),
@@ -169,8 +169,7 @@ def extract_paths(docs):
     for doc in docs:
         seen_paths = set()
         for path, value, siblings in parse_document(doc):
-            parts = path.split('.')
-            depth = len(parts)
+            depth = len(path)  # tuple length
             entry = path_stats[path]
 
             entry["types"].add(infer_type(value))
@@ -196,6 +195,7 @@ def extract_paths(docs):
         for path in seen_paths:
             path_stats[path]["doc_count"] += 1
 
+    # Convert sets to lists for JSON serialization, keep tuple paths as keys
     final = {}
     for path, entry in path_stats.items():
         final[path] = {
@@ -210,6 +210,7 @@ def extract_paths(docs):
             "norm_freq": entry["doc_count"] / num_docs if num_docs else 0,
             "values": entry["values"],
         }
+
     return final
 
 
@@ -299,12 +300,16 @@ def process_files(source_dir, target_dir, source_output_dir, target_output_dir):
         for filename, path_stats in tqdm(results, desc=f"Writing {split_name} CSVs", total=len(results)):
             all_rows = []
             for path, stats in path_stats.items():
-                path_emb = calc_embeddings([path], model, tokenizer).cpu().numpy()
-                values_emb = calc_embeddings(list(stats["values"]), model, tokenizer).cpu().numpy() if stats["values"] else np.zeros(768)
+                # Keep tuple paths as-is
+                path_emb = calc_embeddings([" ".join(path)], model, tokenizer).cpu().numpy()
+                values_emb = (
+                    calc_embeddings(list(stats["values"]), model, tokenizer).cpu().numpy()
+                    if stats["values"] else np.zeros(768)
+                )
 
                 all_rows.append({
                     "filename": filename,
-                    "path": path,
+                    "path": path,  # tuple kept as-is
                     "types": list(stats.get("types", [])),
                     "child_keys": list(stats.get("child_keys", [])),
                     "num_siblings": stats.get("num_siblings", 0),
@@ -326,8 +331,11 @@ def process_files(source_dir, target_dir, source_output_dir, target_output_dir):
                     "freq", "norm_freq", "values", "path_emb", "values_emb"
                 ], delimiter=";")
                 writer.writeheader()
-                writer.writerows(all_rows)
-
+                for row in all_rows:
+                    # Convert tuple to JSON string to safely save in CSV
+                    row_copy = row.copy()
+                    row_copy["path"] = json.dumps(row["path"])
+                    writer.writerow(row_copy)
 
 
 # ----------------------------
