@@ -1,6 +1,8 @@
 import argparse
+import ast
 import base64
 import json
+import math
 import networkx as nx
 import numpy as np
 import pandas as pd
@@ -24,59 +26,74 @@ OUT_DIM = 128
 CODEBERT_DIM = 768
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Type mapping for multi-hot type vectors
+TYPE_MAP = {
+    "string": 0,
+    "integer": 1,
+    "object": 2,
+    "array": 3,
+    "boolean": 4,
+    "null": 5,
+}
+NUM_TYPES = len(TYPE_MAP)
+STRUCT_DIM = 5 + NUM_TYPES  # 5 numeric features + type multi-hot
+
 # -----------------------------
 # DATA UTILITIES
 # -----------------------------
 def load_dataset(path):
+    """Load a CSV dataset containing paths, embeddings, and structural info."""
     return pd.read_csv(path, delimiter=';')
 
 def build_graph(paths):
     """
-    Build a graph from a list of paths. Each path is a node, and edges connect parent-child paths.
+    Build a graph from tuple paths.
 
     Args:
-        paths: list of string paths (e.g. "root.child1.child2")
+        paths: List of tuples, where each tuple is a path like ("rules", "braces")
     Returns:
-        G: networkx Graph with nodes as paths and edges connecting parent-child relationships
+        A NetworkX graph where nodes are paths and edges connect parent-child paths.
     """
     G = nx.Graph()
+
     for path in paths:
-        path = str(path)
         G.add_node(path)
-        if '.' in path:
-            parent = path.rsplit('.', 1)[0]
+
+        if len(path) > 1:
+            parent = path[:-1]
             G.add_edge(parent, path)
+
     return G
 
 def decode_embedding(b64_string, dim=CODEBERT_DIM):
-    """
-    Decode a base64 string into a numpy array of the specified dimension.
-
-    Args:
-        b64_string: base64-encoded string of the embedding
-        dim: expected dimension of the embedding vector
-    Returns:
-        numpy array of shape (dim,) containing the decoded embedding
-    """
+    """Decode base64 string into a numpy array of shape (dim,)"""
     if not b64_string:
         return np.zeros(dim, dtype=np.float32)
     byte_data = base64.b64decode(b64_string)
     arr = np.frombuffer(byte_data, dtype=np.float32)
     return arr.reshape(dim)
 
+def encode_types(type_list):
+    """Convert list of types into a multi-hot torch vector"""
+    vec = torch.zeros(NUM_TYPES)
+    if type_list is None:
+        return vec
+    for t in type_list:
+        if t in TYPE_MAP:
+            vec[TYPE_MAP[t]] = 1.0
+    return vec
+
 def combine_embeddings(df, graph, dim=CODEBERT_DIM):
     """
-    Combine path and value embeddings for each node in the graph. 
+    Combine path and value embeddings with structural features for each node.
 
-    Args:
-        df: DataFrame containing 'path', 'path_emb', and 'values_emb' columns
-        graph: networkx Graph with nodes corresponding to paths in df
-        dim: dimension of each individual embedding (path and value)
     Returns:
-        Tensor of shape (num_nodes, dim*2) containing combined embeddings for each node
+        emb: (num_nodes, CODEBERT_DIM*2) tensor
+        struct_feat: (num_nodes, STRUCT_DIM) tensor
     """
     df_lookup = {row.path: row for row in df.itertuples(index=False)}
     embeddings = []
+    struct_features = []
 
     for node in graph.nodes():
         row = df_lookup.get(node)
@@ -84,144 +101,226 @@ def combine_embeddings(df, graph, dim=CODEBERT_DIM):
         if row is None:
             path_emb = torch.zeros(dim)
             value_emb = torch.zeros(dim)
-
+            struct_feat = torch.zeros(STRUCT_DIM)
         else:
-            path_emb = torch.tensor(
-                decode_embedding(row.path_emb),
-                dtype=torch.float32
-            )
+            path_emb = torch.tensor(decode_embedding(row.path_emb), dtype=torch.float32)
+            value_emb = torch.tensor(decode_embedding(row.values_emb), dtype=torch.float32)
 
-            value_emb = torch.tensor(
-                decode_embedding(row.values_emb),
-                dtype=torch.float32
-            )
+            # ---- STRUCTURAL FEATURES ----
+            num_children = math.log1p(row.num_children)
+            num_siblings = math.log1p(row.num_siblings)
+            depth = math.log1p(row.nesting_depth)
+            freq = row.norm_freq
+            entropy = row.key_entropy
 
-        combined = torch.cat([path_emb, value_emb], dim=0)
-        embeddings.append(combined)
+            type_vec = encode_types(row.types)
+
+            struct_feat = torch.tensor([num_children, num_siblings, depth, freq, entropy], dtype=torch.float32)
+            struct_feat = torch.cat([struct_feat, type_vec], dim=0)
+
+        embeddings.append(torch.cat([path_emb, value_emb], dim=0))
+        struct_features.append(struct_feat)
 
     emb = torch.stack(embeddings).to(device)
-
-    return F.normalize(emb, dim=1)
+    struct_feat = torch.stack(struct_features).to(device)
+    return emb, struct_feat
 
 def get_ground_truth_pairs(ground_truth_path, filename):
     """
-    Load ground truth pairs for a specific filename from the ground truth file.
+    Load all ground truth node pairs for a specific filename.
 
     Args:
-        ground_truth_path: path to the ground truth JSONL file
-        filename: name of the file to extract ground truth pairs for (e.g. "example.json")
+        ground_truth_path: Path to the JSONL file containing ground truth mappings.
+        filename: The specific filename to filter mappings for.
     Returns:
-        set of (source_node, target_node) pairs that are ground truth matches for the given filename
+        A set of (src_tuple, tgt_tuple) pairs.
     """
-
     gt = set()
+
     with open(ground_truth_path, "r") as f:
         for line in f:
             mapping = json.loads(line)
 
-            gt_filename = mapping.get("filename")
-            if gt_filename != filename:
+            if mapping.get("filename") != filename:
                 continue
 
-            src = mapping.get("original_path")
-            tgt = mapping.get("transformed_path")
-            if src and tgt:
+            src_path = mapping.get("original_path")
+            tgt_path = mapping.get("transformed_path")
+
+            if not isinstance(src_path, (list, tuple)):
+                continue
+            if not isinstance(tgt_path, (list, tuple)):
+                continue
+
+            src = tuple(src_path)
+            tgt = tuple(tgt_path)
+
+            if len(src) > 0 and len(tgt) > 0:
                 gt.add((src, tgt))
 
     return gt
 
 def convert_gt_to_indices(gt_pairs, source_nodes, target_nodes):
     """
-    Convert ground truth pairs of node names into index pairs based on their positions in the source and target node lists.
+    Convert ground truth node names into indices for BCE loss.
 
     Args:
-        gt_pairs: set of (source_node, target_node) pairs that are ground truth matches
-        source_nodes: list of node names in the source graph
-        target_nodes: list of node names in the target graph
-    Returns:    
-        list of (source_index, target_index) pairs corresponding to the ground truth matches
+        gt_pairs: Set of (src_tuple, tgt_tuple) ground truth pairs.
+        source_nodes: List of source node tuples.
+        target_nodes: List of target node tuples.
+    Returns:
+        List of (i, j) index pairs where source_nodes[i] matches target_nodes[j] according to gt_pairs.
     """
+    
     src_map = {node: i for i, node in enumerate(source_nodes)}
     tgt_map = {node: j for j, node in enumerate(target_nodes)}
 
     indices = []
-
+    
     for src, tgt in gt_pairs:
-        if src in src_map and tgt in tgt_map:
-            indices.append((src_map[src], tgt_map[tgt]))
+        i = src_map.get(src)
+        j = tgt_map.get(tgt)
+
+        if i is not None and j is not None:
+            indices.append((i, j))
 
     return indices
 
+
+# -----------------------------
+# GRAPH PAIR OBJECT
+# -----------------------------
 class JsonGraphPair:
+    """Represents a source-target graph pair and its ground truth matches."""
 
     def __init__(self, source_df, target_df, gt_pairs):
-
         self.filename = source_df.attrs["filename"]
 
         # ---- SOURCE GRAPH ----
         graph_src = build_graph(source_df["path"])
         self.source_nodes = list(graph_src.nodes())
-        self.source_edge_index = (
-            from_networkx(graph_src)
-            .edge_index
-            .long()
-            .to(device)
-        )
-        self.source_features = combine_embeddings(source_df, graph_src)
+        self.source_edge_index = from_networkx(graph_src).edge_index.long().to(device)
+        self.source_emb, self.source_struct = combine_embeddings(source_df, graph_src)
 
         # ---- TARGET GRAPH ----
         graph_tgt = build_graph(target_df["path"])
         self.target_nodes = list(graph_tgt.nodes())
-        self.target_edge_index = (
-            from_networkx(graph_tgt)
-            .edge_index
-            .long()
-            .to(device)
-        )
-        self.target_features = combine_embeddings(target_df, graph_tgt)
+        self.target_edge_index = from_networkx(graph_tgt).edge_index.long().to(device)
+        self.target_emb, self.target_struct = combine_embeddings(target_df, graph_tgt)
 
         # ---- GROUND TRUTH ----
         self.gt_pairs = gt_pairs
-        self.gt_indices = convert_gt_to_indices(
-            gt_pairs,
-            self.source_nodes,
-            self.target_nodes
-        )
+        self.gt_indices = convert_gt_to_indices(gt_pairs, self.source_nodes, self.target_nodes)
 
 def split_pairs(pairs, train_ratio=0.7, val_ratio=0.15, seed=42):
     """
-    Split a list of JsonGraphPair objects into train, validation, and test sets based on specified ratios.
+    Split a list of JsonGraphPair objects into train/val/test.
 
     Args:
-        pairs: list of JsonGraphPair objects to split
-        train_ratio: proportion of pairs to use for training
-        val_ratio: proportion of pairs to use for validation
+        pairs: List of JsonGraphPair objects.
+        train_ratio: Proportion of pairs to use for training.
+        val_ratio: Proportion of pairs to use for validation.
+        seed: Random seed for reproducibility.
     Returns:
-        train_pairs: list of JsonGraphPair objects for training
-        val_pairs: list of JsonGraphPair objects for validation
-        test_pairs: list of JsonGraphPair objects for testing
-    """ 
-    pairs = list(pairs)  
+        train_pairs, val_pairs, test_pairs: Three lists of JsonGraphPair objects.
+    """
+    pairs = list(pairs)
     random.seed(seed)
     random.shuffle(pairs)
-
     n = len(pairs)
     train_end = int(n * train_ratio)
     val_end = int(n * (train_ratio + val_ratio))
-
     return pairs[:train_end], pairs[train_end:val_end], pairs[val_end:]
 
 
 # -----------------------------
-# MODEL
+# LOSS FUNCTION
+# -----------------------------
+def matching_loss(source_tuple, target_tuple, gt_indices, loss_fn, alpha_type=1.0, alpha_struct=1.0):
+    """
+    Compute a combined loss that incorporates semantic similarity, type similarity, and structural similarity.
+
+    Args:
+        source_tuple: (source_emb, source_struct) where source_emb is (Ns, D) and source_struct is (Ns, STRUCT_DIM)
+        target_tuple: (target_emb, target_struct) where target_emb is (Nt, D) and target_struct is (Nt, STRUCT_DIM)
+        gt_indices: List of (i, j) index pairs indicating ground truth matches between source and target nodes.
+        loss_fn: A binary classification loss function (e.g., BCEWithLogitsLoss) that takes (pred_matrix, gt_matrix) as input.
+        alpha_type: Weight for the type similarity component in the combined similarity score.
+        alpha_struct: Weight for the structural similarity component in the combined similarity score.
+    Returns:
+        A scalar loss value that can be backpropagated.
+    """
+    source_emb, source_struct = source_tuple
+    target_emb, target_struct = target_tuple
+
+    Ns, Nt = source_emb.shape[0], target_emb.shape[0]
+
+    # ---- Semantic similarity ----
+    sem_sim = F.normalize(source_emb, dim=1) @ F.normalize(target_emb, dim=1).T  # (Ns, Nt)
+
+    # ---- Type similarity ----
+    NUM_TYPES = source_struct.shape[1] - 5
+    source_type = source_struct[:, -NUM_TYPES:]
+    target_type = target_struct[:, -NUM_TYPES:]
+    type_sim = source_type @ target_type.T
+    type_sim = type_sim / NUM_TYPES
+
+    # ---- Structural similarity ----
+    source_struct_num = source_struct[:, :3]  # children, siblings, depth
+    target_struct_num = target_struct[:, :3]
+    diff = torch.cdist(source_struct_num, target_struct_num, p=1)
+    struct_sim = 1.0 / (1.0 + diff)
+
+    # ---- Combined similarity ----
+    sim_matrix = sem_sim + alpha_type * type_sim + alpha_struct * struct_sim
+
+    # ---- Ground truth matrix ----
+    gt_matrix = torch.zeros((Ns, Nt), device=source_emb.device)
+    for i, j in gt_indices:
+        gt_matrix[i, j] = 1.0
+
+    return loss_fn(sim_matrix, gt_matrix)
+
+def compute_global_pos_weight(train_pairs):
+    """
+    Compute a global positive weight for BCE loss based on the ratio of positive to negative pairs across the entire training set.
+
+    Args:
+        train_pairs: List of JsonGraphPair objects in the training set.
+    Returns:        
+        A scalar value representing the positive weight to be used in BCEWithLogitsLoss.
+    """
+
+    total_pos = 0
+    total_entries = 0
+    for pair in train_pairs:
+        Ns = pair.source_emb.shape[0]
+        Nt = pair.target_emb.shape[0]
+        total_entries += Ns * Nt
+        total_pos += len(pair.gt_indices)
+    return (total_entries - total_pos) / (total_pos + 1e-8)
+
+
+# -----------------------------
+# GCN MODEL
 # -----------------------------
 class GCN(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, struct_dim=STRUCT_DIM, hidden_dim=HIDDEN_DIM, codebert_dim=CODEBERT_DIM*2, out_dim=OUT_DIM):
         super().__init__()
-        self.conv1 = GCNConv(CODEBERT_DIM*2, HIDDEN_DIM)
-        self.conv2 = GCNConv(HIDDEN_DIM, OUT_DIM)
+        # Project structural features to embedding space
+        self.struct_proj = torch.nn.Sequential(
+            torch.nn.Linear(struct_dim, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, 128)
+        )
+        # GCN layers: semantic + projected structural features
+        self.conv1 = GCNConv(codebert_dim + 128, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, out_dim)
 
-    def forward(self, x, edge_index):
+    def forward(self, x_tuple, edge_index):
+        emb, struct_feat = x_tuple
+        struct_proj = self.struct_proj(struct_feat)
+        x = torch.cat([emb, struct_proj], dim=1)
         h = self.conv1(x, edge_index)
         h = F.relu(h)
         h = self.conv2(h, edge_index)
@@ -229,126 +328,46 @@ class GCN(torch.nn.Module):
 
 
 # -----------------------------
-# LOSS
+# TRAINING LOOP
 # -----------------------------
-def compute_similarity_matrix(source_embs, target_embs):
+def train_model(train_pairs, val_pairs, alpha_type=1.0, alpha_struct=1.0):
     """
-    Compute cosine similarity matrix between source and target embeddings.
+    Train the GCN model on the training set and evaluate on the validation set after each epoch.
 
     Args:
-        source_embs: (Ns, d) source embeddings
-        target_embs: (Nt, d) target embeddings
+        train_pairs: List of JsonGraphPair objects for training.
+        val_pairs: List of JsonGraphPair objects for validation.
+        alpha_type: Weight for the type similarity component in the loss function.
+        alpha_struct: Weight for the structural similarity component in the loss function.
     Returns:
-        (Ns, Nt) similarity matrix where S[i, j] is the cosine similarity between source_embs[i] and target_embs[j]
-    """
-
-    source_embs = F.normalize(source_embs, dim=1)
-    target_embs = F.normalize(target_embs, dim=1)
-
-    return torch.matmul(source_embs, target_embs.T)
-
-def build_gt_matrix(gt_indices, Ns, Nt, device):
-    """
-    Build a binary ground truth matrix of shape (Ns, Nt) where gt_matrix[i, j] = 1 if (i, j) is a ground truth match and 0 otherwise.
-
-    Args:
-        gt_indices: list of (source_index, target_index) pairs that are ground truth matches
-        Ns: number of source nodes
-        Nt: number of target nodes
-        device: torch device to create the matrix on
-    Returns:
-        gt_matrix: (Ns, Nt) binary matrix with 1s at ground truth match positions
-    """
-    gt_matrix = torch.zeros((Ns, Nt), device=device)
-
-    for src_i, tgt_i in gt_indices:
-        gt_matrix[src_i, tgt_i] = 1.0
-
-    return gt_matrix
-
-def matching_loss(source_embs, target_embs, gt_indices, loss_fn):
-    """
-    Compute the loss for a pair of graphs based on the similarity matrix and ground truth matches.
-
-    Args:
-        source_embs: (Ns, d) source embeddings
-        target_embs: (Nt, d) target embeddings
-        gt_indices: list of (source_index, target_index) pairs that are ground truth matches
-        loss_fn: binary classification loss function (e.g. BCEWithLogitsLoss)
-    Returns:
-        loss: scalar loss value for the given pair of graphs
-    """
-    sim_matrix = compute_similarity_matrix(source_embs, target_embs)
-    gt_matrix = build_gt_matrix(
-        gt_indices,
-        source_embs.shape[0],
-        target_embs.shape[0],
-        source_embs.device
-    )
-
-    return loss_fn(sim_matrix, gt_matrix)
-
-
-# -----------------------------
-# TRAINING
-# -----------------------------
-def compute_global_pos_weight(train_pairs):
-    """
-    Compute a global positive class weight for BCE loss based on the ratio of positive to negative pairs across the entire training set.    
-
-    Args:
-        train_pairs: list of JsonGraphPair objects in the training set
-    Returns:
-        pos_weight: float value to use as the pos_weight in BCEWithLogitsLoss
-    """
-
-    total_pos = 0
-    total_entries = 0
-
-    for pair in train_pairs:
-        Ns = pair.source_features.shape[0]
-        Nt = pair.target_features.shape[0]
-        total_entries += Ns * Nt
-        total_pos += len(pair.gt_indices)
-
-    return (total_entries - total_pos) / (total_pos + 1e-8)
-
-def train_model(train_pairs, val_pairs):
-    """
-    Train GCN with BCE loss and evaluate on validation set each epoch.
-
-    Args:
-        train_pairs: list of JsonGraphPair objects for training
-        val_pairs: list of JsonGraphPair objects for validation
-    Returns:
-        model: trained GCN model
+        The trained GCN model.
     """
     wandb.init(project="json-graph-matching")
-
     model = GCN().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    pos_weight = torch.tensor(compute_global_pos_weight(train_pairs), dtype=torch.float32).to(device)
+    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     for epoch in tqdm(range(NUM_EPOCHS), desc="Training"):
-
         model.train()
         total_loss = 0.0
 
         for pair in train_pairs:
             optimizer.zero_grad()
-
-            # Forward pass
-            z_src = model(pair.source_features, pair.source_edge_index)
-            z_tgt = model(pair.target_features, pair.target_edge_index)
-            loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(compute_global_pos_weight(train_pairs)).to(device))
-
-            # Compute BCE loss
-            loss = matching_loss(z_src, z_tgt, pair.gt_indices, loss_fn)
+            z_src_out = model((pair.source_emb, pair.source_struct), pair.source_edge_index)
+            z_tgt_out = model((pair.target_emb, pair.target_struct), pair.target_edge_index)
+            loss = matching_loss(
+                (z_src_out, pair.source_struct),
+                (z_tgt_out, pair.target_struct),
+                pair.gt_indices,
+                loss_fn,
+                alpha_type=alpha_type,
+                alpha_struct=alpha_struct
+            )
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
 
-        # Validation
         val_precision, val_recall, val_f1 = evaluate_model(model, val_pairs, silent=True)
 
         wandb.log({
@@ -359,7 +378,8 @@ def train_model(train_pairs, val_pairs):
             "val_f1": val_f1
         })
 
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS} | Train Loss: {total_loss/len(train_pairs):.4f} | Val Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, F1: {val_f1:.4f}")
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS} | Train Loss: {total_loss/len(train_pairs):.4f} | "
+              f"Val Precision: {val_precision:.4f}, Recall: {val_recall:.4f}, F1: {val_f1:.4f}")
 
     return model
 
@@ -369,80 +389,106 @@ def train_model(train_pairs, val_pairs):
 # -----------------------------
 def match_graphs(source_embs, target_embs, source_nodes, target_nodes):
     """
-    Compute matches from BCE logits using sigmoid + threshold.
+   Match based on cosine similarity of node embeddings.
 
     Args:
-        source_embs: (Ns, d) source embeddings
-        target_embs: (Nt, d) target embeddings
-        source_nodes: list of source node names
-        target_nodes: list of target node names
+        source_embs: (Ns, D) tensor of source node embeddings.
+        target_embs: (Nt, D) tensor of target node embeddings.
+        source_nodes: List of source node tuples.
+        target_nodes: List of target node tuples.
     Returns:
-        dict: {source_node: [matched_target_nodes]}
+        A dictionary mapping each source node to a list of matched target nodes.
     """
     matches = {}
-
     logits = torch.matmul(source_embs, target_embs.T)
-
     for i, s_node in enumerate(source_nodes):
         best_idx = torch.argmax(logits[i])
         matches[s_node] = [target_nodes[best_idx]]
-
     return matches
+
+def ensure_tuple(path):
+    """
+    Ensure the path is a tuple.
+    
+    Args:
+        path: The path to convert to a tuple.
+    Returns:
+        A tuple representation of the path, or None if conversion fails.
+    """
+    if isinstance(path, tuple):
+        return path
+    if isinstance(path, list):
+        return tuple(path)
+    if isinstance(path, str):
+        try:
+            # Handles: "["rules", "braces"]"
+            parsed = ast.literal_eval(path)
+            if isinstance(parsed, (list, tuple)):
+                return tuple(parsed)
+        except:
+            pass
+    return None
 
 def compute_metrics(matches, gt_pairs):
     """
     Compute precision, recall, F1 for predicted matches.
-    
-    Args:
-        matches: dict {source_node: [target_nodes]}
-        gt_pairs: set of (source_node, target_node)
 
+    Args:
+        matches: Dict mapping source nodes to list of matched target nodes.
+        gt_pairs: Set of (src_tuple, tgt_tuple) ground truth pairs.
     Returns:
-        precision: float
-        recall: float
-        f1: float
+        precision, recall, f1: Evaluation metrics.
     """
+
     predicted_pairs = set()
-    for src, tgt_list in matches.items():
-        for tgt in tgt_list:
-            predicted_pairs.add((src, tgt))
+
+    for src, tlist in matches.items():
+        src_t = ensure_tuple(src)
+        if src_t is None:
+            continue
+
+        for tgt in tlist:
+            tgt_t = ensure_tuple(tgt)
+            if tgt_t is None:
+                continue
+
+            predicted_pairs.add((src_t, tgt_t))
+
 
     true_positives = predicted_pairs & gt_pairs
     precision = len(true_positives) / max(1, len(predicted_pairs))
     recall = len(true_positives) / max(1, len(gt_pairs))
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
 
     return precision, recall, f1
 
 def evaluate_model(model, pairs, silent=False):
     """
-    Evaluate a trained model on a list of JsonGraphPair objects.
-
+    Evaluate the model on a list of JsonGraphPair objects.
     Args:
-        model: trained GCN model
-        pairs: list of JsonGraphPair objects to evaluate on
-        silent: if True, suppress printing of individual pair results
+        model: The trained GCN model.
+        pairs: List of JsonGraphPair objects to evaluate on.
+        silent: If True, suppress per-file output.  
     Returns:
-        avg_precision: average precision across all pairs
-        avg_recall: average recall across all pairs
-        avg_f1: average F1 score across all pairs
+        Average precision, recall, and F1 across all pairs.
     """
     model.eval()
-    all_precision = []
-    all_recall = []
-    all_f1 = []
+    all_precision, all_recall, all_f1 = [], [], []
 
     with torch.no_grad():
         for pair in pairs:
-            z_src = model(pair.source_features, pair.source_edge_index)
-            z_tgt = model(pair.target_features, pair.target_edge_index)
-
+            z_src = model((pair.source_emb, pair.source_struct), pair.source_edge_index)
+            z_tgt = model((pair.target_emb, pair.target_struct), pair.target_edge_index)
             matches = match_graphs(z_src, z_tgt, pair.source_nodes, pair.target_nodes)
             precision, recall, f1 = compute_metrics(matches, pair.gt_pairs)
             all_precision.append(precision)
             all_recall.append(recall)
             all_f1.append(f1)
-
             if not silent:
                 print(f"{pair.filename} | precision: {precision:.4f}, recall: {recall:.4f}, F1: {f1:.4f}")
 
@@ -473,29 +519,23 @@ def parse_args():
     parser.add_argument("mode", choices=["train", "eval"])
     return parser.parse_args()
 
+
 def main():
     args = parse_args()
-    source_dir = Path(args.source_dir)
-    target_dir = Path(args.target_dir)
-
+    source_dir, target_dir = Path(args.source_dir), Path(args.target_dir)
     pairs = []
 
-    # Load all datasets and ground truth
+    # Load datasets and ground truth
     for file in tqdm(sorted(source_dir.glob("*.csv"))):
         filename = file.name
-
         src_df = load_dataset(source_dir / filename)
         tgt_df = load_dataset(target_dir / filename)
-
         src_df.attrs["filename"] = filename
-
-        # Change extension to .json for ground truth lookup
-        filename = filename.rsplit('.', 1)[0] + ".json"
-        gt_pairs = get_ground_truth_pairs(args.groundtruth_file, filename)
-
+        # Convert to .json for ground truth
+        filename_json = filename.rsplit('.', 1)[0] + ".json"
+        gt_pairs = get_ground_truth_pairs(args.groundtruth_file, filename_json)
         pairs.append(JsonGraphPair(src_df, tgt_df, gt_pairs))
 
-    # Split into train / validation / test
     train_pairs, val_pairs, test_pairs = split_pairs(pairs)
     print(f"Datasets split: Train={len(train_pairs)}, Val={len(val_pairs)}, Test={len(test_pairs)}")
 
@@ -504,8 +544,7 @@ def main():
         save_model(model)
         test_precision, test_recall, test_f1 = evaluate_model(model, test_pairs, silent=True)
         print(f"Average Test Precision: {test_precision:.4f}, Recall: {test_recall:.4f}, F1: {test_f1:.4f}")
-
-    else:  # eval mode
+    else:
         model = load_model()
         test_precision, test_recall, test_f1 = evaluate_model(model, test_pairs, silent=True)
         print(f"Average Test Precision: {test_precision:.4f}, Recall: {test_recall:.4f}, F1: {test_f1:.4f}")
