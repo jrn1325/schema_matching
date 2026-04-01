@@ -1,13 +1,14 @@
 import argparse
+import ast
 import base64
 import json
 import math
 import numpy as np
 import pandas as pd
 import random
+import sys
 import time
 import torch
-import torch.nn.functional as F
 
 from collections import defaultdict
 from gurobipy import *
@@ -19,13 +20,24 @@ from tqdm import tqdm
 from valentine import valentine_match
 from valentine.algorithms import Coma, Cupid, DistributionBased, JaccardDistanceMatcher, SimilarityFlooding
 
+ARRAY_WILDCARD = "<ARRAY_ITEM>"
+
 VALENTINE_MATCHERS = {
-    "coma": lambda: Coma(java_xmx="4g"),
+    "coma": lambda: Coma(),
     "cupid": lambda: Cupid(),
     "jaccard": lambda: JaccardDistanceMatcher(),
     "distribution": lambda: DistributionBased(),
-    "similarityflooding": lambda: SimilarityFlooding()
+    "similarityflooding": lambda: SimilarityFlooding(),
+    
 }
+
+SIZE_FILTERS = {
+    "small":  lambda n: n <= 100,
+    "medium": lambda n: 100 < n < 500,
+    "large":  lambda n: n >= 500,
+}
+
+
 
 # ----------------------------
 # Type compatibility functions for Jasper
@@ -100,7 +112,6 @@ def combined_embedding(path_emb, value_emb, alpha=0.6):
            (alpha * path_emb + (1-alpha) * value_emb).norm()
 
 
-
 # ----------------------------
 # Structural similarity functions for Jasper
 # ----------------------------
@@ -161,8 +172,8 @@ def get_structural_similarity(s_row, t_row, w_depth=0.25, w_sibling=0.5, w_entro
     Returns:
         float: Structural similarity score between 0 and 1.
     """
-    source_path_keys = s_row["path"].split('.')
-    target_path_keys = t_row["path"].split('.')
+    source_path_keys = s_row["path"]
+    target_path_keys = t_row["path"]
 
     depth_sim = weighted_depth_similarity(source_path_keys, target_path_keys)
 
@@ -251,8 +262,6 @@ def match_paths(source_df, target_df, ling_weight=0.3, struct_weight=0.7, min_sc
 
     source_df = source_df.copy()
     target_df = target_df.copy()
-    source_df["path"] = source_df["path"].astype(str)
-    target_df["path"] = target_df["path"].astype(str)
 
     # Precompute combined embeddings
     source_emb = compute_combined_embeddings(source_df, device)
@@ -286,7 +295,9 @@ def match_paths(source_df, target_df, ling_weight=0.3, struct_weight=0.7, min_sc
             # Combine scores
             final_score = ling_weight * ling_score + struct_weight * struct_score
             if final_score >= min_score:
-                matches[s_row.path].append((t_row.path, final_score))
+                src_path = tuple(ast.literal_eval(s_row.path))
+                tgt_path = tuple(ast.literal_eval(t_row.path))
+                matches[src_path].append((tgt_path, final_score))
 
     return matches
 
@@ -307,9 +318,17 @@ def prune_top_k_candidates(candidate_matches, top_k=5):
     return pruned
 
 def parent_path(path):
-    if "." not in path:
+    """
+    Get the parent/prefix of a JSON path.
+
+    Args:
+        path (list): A JSON path list
+    Returns:
+        list or None: The parent path list, or None if there is no parent.
+    """
+    if len(path) <= 1:
         return None
-    return path.rsplit(".", 1)[0]
+    return path[:-1]
 
 def refine_scores(match_dict, alpha=0.2):
     """
@@ -390,19 +409,6 @@ def final_match(pruned_pairs, alpha=0.2, top_k=1):
 # ----------------------------
 # Step 1: Load SOURCE and TARGET datasets
 # ----------------------------
-def path_dict_to_df(path_dict):
-    """
-    Convert a path_dict to a DataFrame.
-
-    Args:
-        path_dict (dict): Dictionary of paths and their corresponding values.
-    Returns:
-        pd.DataFrame: A DataFrame with paths as columns and values as rows.
-    """
-    # Convert sets to lists and take the first element if there are any values
-    flat_dict = {path: list(values)[0] if values else None for path, values in path_dict.items()}
-    return pd.DataFrame([flat_dict])
-
 def load_dataset(path):
     return pd.read_csv(path, delimiter=";")
 
@@ -439,8 +445,8 @@ def compute_max_depth(source_df, target_df):
     Returns:
         int: Maximum depth of paths.
     """
-    max_source = source_df["path"].apply(lambda x: len(str(x).split('.'))).max()
-    max_target = target_df["path"].apply(lambda x: len(str(x).split('.'))).max()
+    max_source = source_df["path"].apply(lambda x: len(x)).max()
+    max_target = target_df["path"].apply(lambda x: len(x)).max()
 
     return max(max_source, max_target)
 
@@ -571,14 +577,14 @@ def sample_datasets(source_dir, sample_fraction):
 
     # Find the best K and cluster
     best_k, scores = find_best_k(X_scaled)
-    print(f"Best number of clusters = {best_k}")
+    #print(f"Best number of clusters = {best_k}")
 
     kmeans = KMeans(n_clusters=best_k, random_state=42, n_init="auto")
     agg["cluster"] = kmeans.fit_predict(X_scaled)
 
     # Sample datasets from each cluster
     sample_size = int(len(agg) * sample_fraction)
-    print(f"Sampling {sample_size} datasets (~{sample_fraction*100:.0f}%)")
+    #print(f"Sampling {sample_size} datasets (~{sample_fraction*100:.0f}%)")
 
     samples = []
 
@@ -596,12 +602,67 @@ def sample_datasets(source_dir, sample_fraction):
     
 
 # ----------------------------
-# Step 3: Apply matching algorithm
+# Step 3: Apply matching algorithm & Evaluate matches against ground truth
 # ----------------------------
+DELIM = "_DELIMITER_"
+
+def parse_path(s):
+    return tuple(json.loads(s))
+
+def encode_path(p):
+    return DELIM.join(p)
+
+def normalize_path(p):
+    if isinstance(p, str):
+        if DELIM in p:
+            return tuple(p.split(DELIM))
+        else:
+            return (p,)  # <-- critical fix
+    return p
+
+
+def run_valentine(source_df, target_df, matcher, matcher_instance):
+    """
+    Run Valentine matcher.
+    
+    Args:
+        source_df (pd.DataFrame): Source dataset.
+        target_df (pd.DataFrame): Target dataset.
+        matcher (str): Name of the Valentine matcher to use.
+        matcher_instance: Initialized Valentine matcher instance.
+    Returns:    
+        dict: key as source and value as target with score.
+    """
+    # Parse paths once
+    source_paths = source_df["path"].apply(parse_path)
+    target_paths = target_df["path"].apply(parse_path)
+
+    if matcher in ["coma", "cupid", "similarityflooding"]:  # schema matching
+        source_cols = [encode_path(p) for p in source_paths]
+        target_cols = [encode_path(p) for p in target_paths]
+
+        new_source_df = pd.DataFrame(columns=source_cols)
+        new_target_df = pd.DataFrame(columns=target_cols)
+
+    elif matcher in ["jaccard", "distribution"]:  # instance matching
+        source_df = source_df.copy()
+        target_df = target_df.copy()
+
+        source_df["path"] = source_paths.apply(encode_path)
+        target_df["path"] = target_paths.apply(encode_path)
+
+        source_df["values"] = source_df["values"].apply(json.loads)
+        target_df["values"] = target_df["values"].apply(json.loads)
+
+        new_source_df = source_df.set_index("path")["values"].apply(pd.Series).T
+        new_target_df = target_df.set_index("path")["values"].apply(pd.Series).T
+
+    matches = valentine_match(new_source_df, new_target_df, matcher_instance, "source", "target")
+    return matches
+
 def reformat_valentine_matches(valentine_matches):
     """
-    Remove the first element of the paths in Valentine matches.
-    It's necessary because Valentine returns paths with a labelled "source" or "target" at the beginning.
+    Reformat Valentine matches from {(source_path, target_path): score} with encoded paths to {(source_path, target_path): score} with decoded paths.   
 
     Args:
         valentine_matches (dict): {(source_path,(target_path): score)}
@@ -611,16 +672,231 @@ def reformat_valentine_matches(valentine_matches):
     """
     matches = defaultdict(list)
 
-    for (tgt, src), score in valentine_matches.items():
-        new_tgt = ".".join(tgt[1:])
-        new_src = ".".join(src[1:])
-        matches[(new_src, new_tgt)].append(score)
+    for (src, tgt), score in valentine_matches.items():
+        # Extract path directly (Valentine format: (side, path))
+        src_path = src[1]
+        tgt_path = tgt[1]
+
+        src_path = normalize_path(src_path)
+        tgt_path = normalize_path(tgt_path)
+
+        matches[(src_path, tgt_path)].append(score)
 
     return matches
 
+
 # ----------------------------
-# Step 4: Evaluate matches against ground truth
+# Step 4: Apply quadratic programming
 # ----------------------------
+def get_depth(path):
+    """
+    Get the depth of a JSON path, defined as the number of keys in the path.
+
+    Args:
+        path (list): A JSON path as a list of keys, e.g., ["user", "address", "street"] for "user.address.street".
+    Returns:
+        int: The depth of the path.
+    
+    """
+    return len(path)
+
+def structurally_incompatible(s1, s2, t1, t2):
+    """
+    Check if two matches (s1→t1 and s2→t2) are structurally incompatible.   
+    Structural incompatibility occurs when:
+    1. The source paths share a parent but the target paths do not (or vice versa).
+    2. The source paths have significantly different depths but the target paths do not (or vice versa).
+
+    Args:       
+        s1, s2 (str): Source paths.
+        t1, t2 (str): Target paths.
+    Returns:    
+        bool: True if the matches are structurally incompatible, False otherwise.
+    """
+
+    # Prevent crossing hierarchy
+    if share_parent(s1, s2) and not share_parent(t1, t2):
+        return True
+
+    # Prevent depth mismatch explosion
+    if abs(get_depth(s1) - get_depth(t1)) > 2:
+        return True
+
+    return False
+
+def get_parent(path):
+    """
+    Get the parent path of a JSON path.
+
+    Args:
+        path (list): A JSON path as a list of keys, e.g., ["user", "address", "street"] for "user.address.street".
+    Returns:
+        list or None: The parent path, e.g., ["user", "address"] for ["user", "address", "street"]. Returns None if there is no parent.
+    """
+
+    if len(path) <= 1:
+        return None
+
+    return path[:-1]
+
+def share_parent(p1, p2):
+    """
+    Check if two paths share the same parent.
+
+    Args:
+        p1, p2 (list): Two JSON path lists.
+
+    Returns:
+        bool: True if the paths share the same parent, False otherwise.
+    """
+    return get_parent(p1) == get_parent(p2)
+
+def parent_similarity_bonus(s_path, t_path):
+
+    s_parent = get_parent(s_path)
+    t_parent = get_parent(t_path)
+
+    if not s_parent or not t_parent:
+        return False
+
+    return s_parent == t_parent
+
+def likely_related(s1, s2):
+    """
+    Heuristic to quickly check if two source paths are likely related based on their depth and parent.
+
+    Args:    
+        s1, s2 (str): Two source JSON paths.
+    Returns:    
+        bool: True if the paths are likely related, False otherwise.
+    """
+    if get_depth(s1) != get_depth(s2):
+        return False
+
+    if get_parent(s1) != get_parent(s2):
+        return False
+
+    return True
+
+def extract_solution(x_vars, candidate_matches):
+    """"
+    Extract the solution from the quadratic programming variables.
+
+    Args:
+        x_vars (dict): A dictionary of (source_path, target_path) -> variable.
+
+    Returns:
+        dict: A dictionary of source_path -> target_path for selected matches.
+    """
+    
+    matches = {}
+
+    for (s_path, t_path), var in x_vars.items():
+
+        if var.X > 0.5:
+            # Recover original score
+            score = dict(candidate_matches[s_path])[t_path]
+
+            matches[(s_path, t_path)] = score
+
+    return matches
+
+def quadratic_programming(candidate_matches, lambda_parent=0.7, lambda_conflict=1.5):
+
+    model = Model("json_matching_ilp")
+    model.setParam("OutputFlag", False)
+
+    x_vars = {}
+    source_vars = defaultdict(list)
+    target_vars = defaultdict(list)
+
+    linear_terms = []
+
+    # -----------------------------------
+    # 1️ Decision Variables + Scores
+    # -----------------------------------
+    for s_path, targets in candidate_matches.items():
+
+        for t_path, score in targets:
+
+            # Optional Parent Bonus (Linearized Heuristic)
+            adjusted_score = score
+
+            if parent_similarity_bonus(s_path, t_path):
+                adjusted_score += lambda_parent
+
+            x = model.addVar(
+                vtype=GRB.BINARY,
+                name=f"{s_path}__{t_path}"
+            )
+
+            x_vars[(s_path, t_path)] = x
+            source_vars[s_path].append(x)
+            target_vars[t_path].append(x)
+
+            linear_terms.append(adjusted_score * x)
+
+    # -----------------------------------
+    # 2️ Hard Constraint: Unique Source
+    # -----------------------------------
+    for s_path, vars_list in source_vars.items():
+        model.addConstr(quicksum(vars_list) <= 1)
+
+    # -----------------------------------
+    # 3️ Hard Constraint: Unique Target
+    # -----------------------------------
+    for t_path, vars_list in target_vars.items():
+        model.addConstr(quicksum(vars_list) <= 1)
+
+    # -----------------------------------
+    # 4️ Structural Conflict Constraints
+    # -----------------------------------
+    keys = list(x_vars.keys())
+
+    for i in range(len(keys)):
+        s1, t1 = keys[i]
+        x1 = x_vars[(s1, t1)]
+
+        for j in range(i + 1, len(keys)):
+            s2, t2 = keys[j]
+            x2 = x_vars[(s2, t2)]
+
+            if structurally_incompatible(s1, s2, t1, t2):
+                model.addConstr(x1 + x2 <= 1)
+
+    # -----------------------------------
+    # 5️ Linear Objective
+    # -----------------------------------
+    model.setObjective(quicksum(linear_terms), GRB.MAXIMIZE)
+
+    model.optimize()
+
+    if model.status != GRB.OPTIMAL:
+        print(f"Warning: Status {model.status}")
+        return {}
+
+    return extract_solution(x_vars, candidate_matches)
+
+def run_jasper(source_df, target_df, device):
+    """
+    Run Jasper matcher and evaluate.
+    
+    Args:
+        source_df (pd.DataFrame): Source dataset.
+        target_df (pd.DataFrame): Target dataset.
+        device (str): Device to use for tensor computations.
+    Returns:    
+        dict: key as (source, target) and value as score.
+    """
+    candidate_matches = match_paths(source_df, target_df, ling_weight=0.5, struct_weight=0.5, min_score=0.7, device=device)
+    pruned_matches = prune_top_k_candidates(candidate_matches, top_k=3)
+    pruned_pairs = {s: [(t, score) for t, score in tgts] for s, tgts in pruned_matches.items()}
+    #final_matches = quadratic_programming(pruned_pairs)ribution
+    final_matches = final_match(pruned_pairs, alpha=0.2, top_k=1)
+    return final_matches
+
+
+
 def get_ground_truth_pairs(ground_truth_path, filename):
     """
     Load all (source_path, target_path) pairs from ground truth JSON file.
@@ -641,16 +917,15 @@ def get_ground_truth_pairs(ground_truth_path, filename):
             mapping = json.loads(line)
             if mapping.get("filename") != filename:
                 continue
-            src = mapping.get("original_path")
-            tgt = mapping.get("transformed_path")
-            if src is not None and tgt is not None:
-                gt.add((src, tgt))
+
+            src = tuple(mapping["original_path"])
+            tgt = tuple(mapping["transformed_path"])
+            gt.add((src, tgt))
     return gt
 
 def evaluate_matches(matches, ground_truth_pairs):
     """
-    Evaluate predicted matches against ground truth from a JSON file,
-    restricted to the source paths found in `matches`.
+    Evaluate predicted matches against ground truth from a JSON file
 
     Args:
         matches (dict): Predicted matches in the form {(source_path, target_path): score}.
@@ -694,25 +969,7 @@ def evaluate_matches(matches, ground_truth_pairs):
         "false_negatives": fn,
     }
 
-def evaluate_valentine(source_df, target_df, gt_pairs, matcher_name, matcher_instance):
-    """Run Valentine matcher and evaluate."""
-    new_source_df = pd.DataFrame(columns=source_df["path"].astype(str))
-    new_target_df = pd.DataFrame(columns=target_df["path"].astype(str))
 
-    matches = valentine_match(new_target_df, new_source_df, matcher_instance, "target", "source")
-    formatted_matches = reformat_valentine_matches(matches)
-    metrics = evaluate_matches(formatted_matches, gt_pairs)
-    return metrics
-
-def evaluate_jasper(source_df, target_df, gt_pairs, device):
-    """Run Jasper matcher and evaluate."""
-    candidate_matches = match_paths(source_df, target_df, ling_weight=0.5, struct_weight=0.5, min_score=0.7, device=device)
-    pruned_matches = prune_top_k_candidates(candidate_matches, top_k=5)
-    pruned_pairs = {s: [(t, score) for t, score in tgts] for s, tgts in pruned_matches.items()}
-    final_matches = final_match(pruned_pairs, alpha=0.2, top_k=1)
-    metrics = evaluate_matches(final_matches, gt_pairs)
-    metrics.update({"matcher": "JASPER"})
-    return metrics
 
 
 # ----------------------------
@@ -724,18 +981,24 @@ def parse_args():
     parser.add_argument("target_dir", help="Directory with target csv files")
     parser.add_argument("groundtruth_file", help="Path to ground truth JSON file.")
     parser.add_argument("mode", choices=["coma", "cupid", "jaccard", "distribution", "similarityflooding", "jasper"], help="Matching algorithm to use.")
+    parser.add_argument("size", type=str, choices=["small", "medium", "large"], help="Size of datasets to process.")
     return parser.parse_args()
 
 def main():
     start_time = time.time()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
     args = parse_args()
 
-    # Sample datasets
-    selected_datasets = sample_datasets(args.source_dir, sample_fraction=1.0)
-    print(f"Evaluating {len(selected_datasets)} datasets. Mode: {args.mode}", flush=True)
+    source_dir = Path(args.source_dir)
+    target_dir = Path(args.target_dir)
+    source_files = {f.name for f in source_dir.glob("*.csv")}
 
-    # Initialize matcher once
+    size_filter = SIZE_FILTERS[args.size]
+
+    # -----------------------
+    # Initialize matcher
+    # -----------------------
     if args.mode in VALENTINE_MATCHERS:
         matcher_instance = VALENTINE_MATCHERS[args.mode]()
         mode_type = "valentine"
@@ -743,53 +1006,95 @@ def main():
         matcher_instance = None
         mode_type = "jasper"
     else:
-        raise ValueError("Invalid mode. Choose from Valentine matcher keys or 'jasper'")
+        raise ValueError("Invalid mode")
 
-    min_paths = 100
-    max_paths = 500
-    precision_list = []
-    recall_list = []
-    f1_list = []
+    precision_list, recall_list, f1_list = [], [], []
+    time_dict = {}
 
-    for filename in tqdm(sorted(selected_datasets), desc="Processing datasets"):
-        source_path = Path(args.source_dir) / filename.replace(".json", ".csv")
-        target_path = Path(args.target_dir) / filename.replace(".json", ".csv")
+    # -----------------------
+    # Main loop
+    # -----------------------
+    for filename in tqdm(source_files, desc="Processing datasets"):
+
+        source_path = source_dir / filename
+        target_path = target_dir / filename
+
         source_df = load_dataset(source_path)
         target_df = load_dataset(target_path)
-        gt_pairs = get_ground_truth_pairs(args.groundtruth_file, filename)
 
-        #if len(source_df) > min_paths and len(source_df) < max_paths:
-        #if len(source_df) <= min_paths:
-        if len(source_df) >= max_paths:
-            print(f"\nProcessing {filename}: {len(source_df)} → {len(target_df)} paths, {len(gt_pairs)} GT pairs.", flush=True)
+        # Size bucket filter (OPEN-ENDED)
+        if not size_filter(len(source_df)):
+            continue
 
-            if mode_type == "valentine":
-                metrics = evaluate_valentine(source_df, target_df, gt_pairs, args.mode, matcher_instance)
-            else:
-                metrics = evaluate_jasper(source_df, target_df, gt_pairs, device=device)
+        gt_pairs = get_ground_truth_pairs(
+            args.groundtruth_file,
+            filename.replace(".csv", ".json")
+        )
 
-            metrics.update({"filename": filename})
+        print(
+            f"\nProcessing {filename}: "
+            f"{len(source_df)} → {len(target_df)} paths, "
+            f"{len(gt_pairs)} GT pairs.",
+            flush=True
+        )
 
-            print(f"Metrics for {filename}: P={metrics['precision']:.2f}, R={metrics['recall']:.2f}, F1={metrics['f1_score']:.2f}", flush=True)
-            precision_list.append(metrics['precision'])
-            recall_list.append(metrics['recall'])
-            f1_list.append(metrics['f1_score'])
+        file_start_time = time.time()
 
-    # Print average precision, recall, f1 to nearest 2 decimals
-    print(f"\n=== Overall Evaluation  of  {args.mode} ===", flush=True)
+        if mode_type == "valentine":
+            matches = run_valentine(source_df, target_df, args.mode, matcher_instance)
+            matches = reformat_valentine_matches(matches)
+        else:
+            matches = run_jasper(source_df, target_df, device=device)
+
+        duration = round(time.time() - file_start_time, 2)
+
+        metrics = evaluate_matches(matches, gt_pairs)
+
+        print(
+            f"Time: {duration}s | "
+            f"P={metrics['precision']:.3f}, "
+            f"R={metrics['recall']:.3f}, "
+            f"F1={metrics['f1_score']:.3f}",
+            flush=True
+        )
+
+        precision_list.append(metrics["precision"])
+        recall_list.append(metrics["recall"])
+        f1_list.append(metrics["f1_score"])
+
+        time_dict[filename] = {
+            "time": duration,
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "f1": metrics["f1_score"],
+        }
+
+    # -----------------------
+    # Aggregate stats
+    # -----------------------
     avg_precision = sum(precision_list) / len(precision_list) if precision_list else 0
     avg_recall = sum(recall_list) / len(recall_list) if recall_list else 0
     avg_f1 = sum(f1_list) / len(f1_list) if f1_list else 0
-    print(f"Average Precision: {avg_precision:.2f}", flush=True)
-    print(f"Average Recall:    {avg_recall:.2f}", flush=True)
-    print(f"Average F1 Score:  {avg_f1:.2f}", flush=True)   
 
-    print(f"Execution time: {round(time.time() - start_time, 2)} seconds", flush=True)
+    print(f"\n=== Overall Evaluation of {args.mode} ===")
+    print(f"Average Precision: {avg_precision:.3f}")
+    print(f"Average Recall:    {avg_recall:.3f}")
+    print(f"Average F1 Score:  {avg_f1:.3f}")
+    print(f"Execution time: {round(time.time() - start_time, 2)} seconds")
+
+    # Sort by runtime descending
+    time_dict = dict(
+        sorted(time_dict.items(),
+               key=lambda item: item[1]["time"],
+               reverse=True)
+    )
+
+    out_file = f"{args.mode}_{args.size}_execution_times.json"
+    with open(out_file, "w") as f:
+        json.dump(time_dict, f, indent=4)
+
+    print(f"Saved results to {out_file}")
+
 
 if __name__ == "__main__":
     main()
-
-
-
-# As k increases, how is f1 score affected
-# As k increases during pruning, check how many times we catch the correct answers
