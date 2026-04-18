@@ -1,5 +1,7 @@
 import argparse
 import ast
+import valentine.algorithms as algos
+print(dir(algos))
 import base64
 import json
 import math
@@ -20,10 +22,13 @@ from tqdm import tqdm
 from valentine import valentine_match
 from valentine.algorithms import Coma, Cupid, DistributionBased, JaccardDistanceMatcher, SimilarityFlooding
 
+
+
 ARRAY_WILDCARD = "<ARRAY_ITEM>"
+DELIM = "_DELIM_"
 
 VALENTINE_MATCHERS = {
-    "coma": lambda: Coma(),
+    "coma": lambda: Coma(use_instances=True),
     "cupid": lambda: Cupid(),
     "jaccard": lambda: JaccardDistanceMatcher(),
     "distribution": lambda: DistributionBased(),
@@ -34,7 +39,8 @@ VALENTINE_MATCHERS = {
 SIZE_FILTERS = {
     "small":  lambda n: n <= 100,
     "medium": lambda n: 100 < n < 500,
-    "large":  lambda n: n >= 500,
+    "large":  lambda n: 500 <= n < 1000,
+    "xlarge": lambda n: n >= 1000
 }
 
 
@@ -246,7 +252,7 @@ def compute_combined_embeddings(df, device):
     emb = torch.nn.functional.normalize(emb, dim=1)
     return emb
 
-def match_paths(source_df, target_df, ling_weight=0.3, struct_weight=0.7, min_score=0.7, device="cuda"):
+def match_paths(source_df, target_df, ling_weight=1.0, struct_weight=0.0, min_score=0.7, device="cuda"):
     """
     Match paths from two sets using precomputed embeddings and structural similarity.
     Args:
@@ -604,7 +610,6 @@ def sample_datasets(source_dir, sample_fraction):
 # ----------------------------
 # Step 3: Apply matching algorithm & Evaluate matches against ground truth
 # ----------------------------
-DELIM = "_DELIMITER_"
 
 def parse_path(s):
     return tuple(json.loads(s))
@@ -617,8 +622,36 @@ def normalize_path(p):
         if DELIM in p:
             return tuple(p.split(DELIM))
         else:
-            return (p,)  # <-- critical fix
+            return (p,)
     return p
+
+def safe_parse_values(x):
+    # Case 1: already a list/dict
+    if isinstance(x, (list, dict)):
+        return x
+
+    if not isinstance(x, str):
+        return x
+
+    s = x.strip()
+
+    if not s:
+        return []
+
+    # Step 1: try JSON
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+
+    # Step 2: try Python literal
+    try:
+        return ast.literal_eval(s)
+    except (ValueError, SyntaxError):
+        pass
+
+    # Step 3: fallback (return raw string)
+    return x
 
 
 def run_valentine(source_df, target_df, matcher, matcher_instance):
@@ -651,8 +684,8 @@ def run_valentine(source_df, target_df, matcher, matcher_instance):
         source_df["path"] = source_paths.apply(encode_path)
         target_df["path"] = target_paths.apply(encode_path)
 
-        source_df["values"] = source_df["values"].apply(json.loads)
-        target_df["values"] = target_df["values"].apply(json.loads)
+        source_df["values"] = source_df["values"].apply(safe_parse_values)
+        target_df["values"] = target_df["values"].apply(safe_parse_values)
 
         new_source_df = source_df.set_index("path")["values"].apply(pd.Series).T
         new_target_df = target_df.set_index("path")["values"].apply(pd.Series).T
@@ -888,7 +921,7 @@ def run_jasper(source_df, target_df, device):
     Returns:    
         dict: key as (source, target) and value as score.
     """
-    candidate_matches = match_paths(source_df, target_df, ling_weight=0.5, struct_weight=0.5, min_score=0.7, device=device)
+    candidate_matches = match_paths(source_df, target_df, ling_weight=1.0, struct_weight=0.0, min_score=0.7, device=device)
     pruned_matches = prune_top_k_candidates(candidate_matches, top_k=3)
     pruned_pairs = {s: [(t, score) for t, score in tgts] for s, tgts in pruned_matches.items()}
     #final_matches = quadratic_programming(pruned_pairs)ribution
@@ -981,7 +1014,7 @@ def parse_args():
     parser.add_argument("target_dir", help="Directory with target csv files")
     parser.add_argument("groundtruth_file", help="Path to ground truth JSON file.")
     parser.add_argument("mode", choices=["coma", "cupid", "jaccard", "distribution", "similarityflooding", "jasper"], help="Matching algorithm to use.")
-    parser.add_argument("size", type=str, choices=["small", "medium", "large"], help="Size of datasets to process.")
+    parser.add_argument("size", type=str, choices=["small", "medium", "large", "xlarge"], help="Size of datasets to process.")
     return parser.parse_args()
 
 def main():
@@ -1010,6 +1043,8 @@ def main():
 
     precision_list, recall_list, f1_list = [], [], []
     time_dict = {}
+
+    print(f"\n=== Running {args.mode} ===")
 
     # -----------------------
     # Main loop
